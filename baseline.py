@@ -79,7 +79,8 @@ class FullMAML(BaselineMethod):
         self.logger.info("Starting Full MAML training")
         self.logger.warning("This method is memory-intensive and may not fit on consumer GPUs")
         
-        for iteration in range(num_iterations):
+        pbar = tqdm(range(num_iterations), desc="FullMAML Training")
+        for iteration in pbar:
             # Sample task batch
             task_indices = np.random.choice(len(meta_train_tasks), 
                                           self.meta_batch_size, replace=True)
@@ -87,6 +88,9 @@ class FullMAML(BaselineMethod):
             
             # Meta-training step
             meta_loss = self._meta_train_step(task_batch)
+            
+            # Update progress bar
+            pbar.set_postfix({'loss': f'{meta_loss:.4f}'})
             
             # Logging
             if iteration % self.config['training']['log_interval'] == 0:
@@ -105,11 +109,13 @@ class FullMAML(BaselineMethod):
         total_loss = 0.0
         
         for support_set, query_set in task_batch:
-            # Clone model for inner loop
-            fast_weights = []
-            for param in self.model.parameters():
-                fast_weights.append(param.clone())
-                
+            # Get initial LoRA parameters
+            lora_params = self.model.get_lora_parameters()
+            fast_weights = [p.clone() for p in lora_params]
+            
+            # Create parameter mapping for functional forward
+            param_dict = self._create_param_dict(fast_weights)
+            
             # Inner loop adaptation
             for _ in range(self.inner_steps):
                 support_loader = self.dataset_loader.get_data_loader(
@@ -120,7 +126,7 @@ class FullMAML(BaselineMethod):
                     batch = utils.move_to_device(batch, self.device)
                     
                     # Forward with fast weights
-                    outputs = self._functional_forward(batch, fast_weights)
+                    outputs = self._functional_forward(batch, param_dict)
                     loss = outputs['loss']
                     
                     # Compute gradients
@@ -134,6 +140,9 @@ class FullMAML(BaselineMethod):
                     fast_weights = [w - self.inner_lr * g 
                                   for w, g in zip(fast_weights, grads)]
                     
+                    # Update parameter dictionary
+                    param_dict = self._create_param_dict(fast_weights)
+                    
             # Compute query loss
             query_loader = self.dataset_loader.get_data_loader(
                 query_set, batch_size=len(query_set)
@@ -141,7 +150,7 @@ class FullMAML(BaselineMethod):
             
             for batch in query_loader:
                 batch = utils.move_to_device(batch, self.device)
-                outputs = self._functional_forward(batch, fast_weights)
+                outputs = self._functional_forward(batch, param_dict)
                 query_loss = outputs['loss']
                 total_loss += query_loss
                 
@@ -156,11 +165,74 @@ class FullMAML(BaselineMethod):
         
         return total_loss.item()
     
-    def _functional_forward(self, batch: Dict, params: List[torch.Tensor]) -> Dict:
+    def _create_param_dict(self, fast_weights: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Create parameter dictionary from flat weight list."""
+        param_dict = {}
+        idx = 0
+        
+        # Map LoRA parameters
+        for name, layer in self.model.lora_layers.items():
+            # lora_A
+            param_shape = layer.lora_A.shape
+            param_size = layer.lora_A.numel()
+            param_dict[f"{name}.lora_A"] = fast_weights[idx].view(param_shape)
+            idx += 1
+            
+            # lora_B
+            param_shape = layer.lora_B.shape
+            param_size = layer.lora_B.numel()
+            param_dict[f"{name}.lora_B"] = fast_weights[idx].view(param_shape)
+            idx += 1
+        
+        # Map classifier parameters
+        # Weight
+        param_shape = self.model.classifier.weight.shape
+        param_dict["classifier.weight"] = fast_weights[idx].view(param_shape)
+        idx += 1
+        
+        # Bias
+        if self.model.classifier.bias is not None:
+            param_shape = self.model.classifier.bias.shape
+            param_dict["classifier.bias"] = fast_weights[idx].view(param_shape)
+        
+        return param_dict
+    
+    def _functional_forward(self, batch: Dict, param_dict: Dict[str, torch.Tensor]) -> Dict:
         """Functional forward pass with given parameters."""
-        # This is a simplified version - full implementation would need
-        # to properly handle all model parameters
-        raise NotImplementedError("Full functional forward not implemented")
+        # Temporarily replace model parameters with fast weights
+        original_params = {}
+        
+        # Replace LoRA parameters
+        for name, layer in self.model.lora_layers.items():
+            # Save original parameters
+            original_params[f"{name}.lora_A"] = layer.lora_A.data
+            original_params[f"{name}.lora_B"] = layer.lora_B.data
+            
+            # Set new parameters
+            layer.lora_A.data = param_dict[f"{name}.lora_A"]
+            layer.lora_B.data = param_dict[f"{name}.lora_B"]
+        
+        # Replace classifier parameters
+        original_params["classifier.weight"] = self.model.classifier.weight.data
+        self.model.classifier.weight.data = param_dict["classifier.weight"]
+        
+        if self.model.classifier.bias is not None:
+            original_params["classifier.bias"] = self.model.classifier.bias.data
+            self.model.classifier.bias.data = param_dict["classifier.bias"]
+        
+        # Forward pass with new parameters
+        outputs = self.model(**batch)
+        
+        # Restore original parameters
+        for name, layer in self.model.lora_layers.items():
+            layer.lora_A.data = original_params[f"{name}.lora_A"]
+            layer.lora_B.data = original_params[f"{name}.lora_B"]
+        
+        self.model.classifier.weight.data = original_params["classifier.weight"]
+        if self.model.classifier.bias is not None:
+            self.model.classifier.bias.data = original_params["classifier.bias"]
+        
+        return outputs
         
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
         """Evaluate on test tasks."""
@@ -241,7 +313,8 @@ class FOMAML(BaselineMethod):
         
         self.logger.info("Starting FOMAML training")
         
-        for iteration in range(num_iterations):
+        pbar = tqdm(range(num_iterations), desc="FOMAML Training")
+        for iteration in pbar:
             # Sample task batch
             task_indices = np.random.choice(len(meta_train_tasks), 
                                           self.meta_batch_size, replace=True)
@@ -249,6 +322,9 @@ class FOMAML(BaselineMethod):
             
             # Meta-training step
             meta_loss = self._meta_train_step(task_batch)
+            
+            # Update progress bar
+            pbar.set_postfix({'loss': f'{meta_loss:.4f}'})
             
             # Logging
             if iteration % self.config['training']['log_interval'] == 0:
@@ -265,10 +341,15 @@ class FOMAML(BaselineMethod):
         self.meta_optimizer.zero_grad()
         
         total_loss = 0.0
+        accumulated_grads = []
+        
+        # Save original parameters once
+        original_params = [p.clone() for p in self.model.get_lora_parameters()]
         
         for support_set, query_set in task_batch:
-            # Clone current parameters
-            original_params = [p.clone() for p in self.model.get_lora_parameters()]
+            # Reset to original parameters for each task
+            for p, orig_p in zip(self.model.get_lora_parameters(), original_params):
+                p.data = orig_p.data.clone()
             
             # Inner loop adaptation
             inner_optimizer = torch.optim.SGD(
@@ -289,28 +370,43 @@ class FOMAML(BaselineMethod):
                     loss.backward()
                     inner_optimizer.step()
                     
-            # Compute query loss
+            # Compute query loss at adapted parameters
             query_loader = self.dataset_loader.get_data_loader(
                 query_set, batch_size=len(query_set)
             )
+            
+            # Zero grad before computing query loss
+            self.meta_optimizer.zero_grad()
             
             for batch in query_loader:
                 batch = utils.move_to_device(batch, self.device)
                 outputs = self.model(**batch)
                 query_loss = outputs['loss']
                 
-                # First-order approximation: treat adapted params as constants
+                # First-order approximation: compute gradients at adapted params
                 query_loss.backward()
                 total_loss += query_loss.item()
                 
-            # Restore original parameters
-            for p, orig_p in zip(self.model.get_lora_parameters(), original_params):
-                p.data = orig_p
+            # Store gradients computed at adapted parameters
+            if len(accumulated_grads) == 0:
+                accumulated_grads = [p.grad.clone() if p.grad is not None else None 
+                                   for p in self.model.get_lora_parameters()]
+            else:
+                for i, p in enumerate(self.model.get_lora_parameters()):
+                    if p.grad is not None:
+                        if accumulated_grads[i] is None:
+                            accumulated_grads[i] = p.grad.clone()
+                        else:
+                            accumulated_grads[i] += p.grad
                 
+        # Restore original parameters before applying gradients
+        for p, orig_p in zip(self.model.get_lora_parameters(), original_params):
+            p.data = orig_p.data
+            
         # Apply accumulated gradients
-        for p in self.model.get_lora_parameters():
-            if p.grad is not None:
-                p.grad = p.grad / len(task_batch)
+        for p, grad in zip(self.model.get_lora_parameters(), accumulated_grads):
+            if grad is not None:
+                p.grad = grad / len(task_batch)
                 
         self.meta_optimizer.step()
         
@@ -392,7 +488,8 @@ class Reptile(BaselineMethod):
         
         self.logger.info("Starting Reptile training")
         
-        for iteration in range(num_iterations):
+        pbar = tqdm(range(num_iterations), desc="Reptile Training")
+        for iteration in pbar:
             # Sample task
             task_idx = np.random.choice(len(meta_train_tasks))
             support_set, _ = meta_train_tasks[task_idx]
@@ -402,6 +499,9 @@ class Reptile(BaselineMethod):
             
             # Inner loop optimization
             optimizer = torch.optim.SGD(self.model.get_lora_parameters(), lr=self.lr)
+            
+            total_loss = 0.0
+            num_batches = 0
             
             for _ in range(self.inner_steps):
                 support_loader = self.dataset_loader.get_data_loader(
@@ -413,6 +513,9 @@ class Reptile(BaselineMethod):
                     outputs = self.model(**batch)
                     loss = outputs['loss']
                     
+                    total_loss += loss.item()
+                    num_batches += 1
+                    
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
@@ -421,9 +524,13 @@ class Reptile(BaselineMethod):
             for p, init_p in zip(self.model.get_lora_parameters(), initial_params):
                 p.data = init_p + self.epsilon * (p.data - init_p)
                 
+            # Update progress bar with average loss
+            avg_loss = total_loss / num_batches if num_batches > 0 else 0
+            pbar.set_postfix({'loss': f'{avg_loss:.4f}'})
+                
             # Logging
             if iteration % self.config['training']['log_interval'] == 0:
-                self.logger.info(f"Iteration {iteration}")
+                self.logger.info(f"Iteration {iteration}: Loss = {avg_loss:.4f}")
                 
             # Validation
             if meta_val_tasks and iteration % 100 == 0:
