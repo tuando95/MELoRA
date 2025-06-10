@@ -167,7 +167,7 @@ class FullMAML(BaselineMethod):
             fast_params = params
             for _ in range(self.inner_steps):
                 support_batch_device = utils.move_to_device(support_batch, self.device)
-                support_outputs = func.functional_call(self.model, (fast_params, buffers), support_batch_device)
+                support_outputs = func.functional_call(self.model, (fast_params, buffers), args=(), kwargs=support_batch_device)
                 grads = torch.autograd.grad(support_outputs['loss'], list(fast_params.values()), create_graph=True, allow_unused=True)
                 fast_params = {
                     name: p - self.inner_lr * g if g is not None else p
@@ -175,7 +175,7 @@ class FullMAML(BaselineMethod):
                 }
             
             query_batch_device = utils.move_to_device(query_batch, self.device)
-            query_outputs = func.functional_call(self.model, (fast_params, buffers), query_batch_device)
+            query_outputs = func.functional_call(self.model, (fast_params, buffers), args=(), kwargs=query_batch_device)
             return query_outputs['loss']
 
         in_dims = (None, None, 0, 0)
@@ -357,7 +357,7 @@ class FOMAML(BaselineMethod):
                 support_batch_device = utils.move_to_device(support_batch, self.device)
                 
                 # Compute loss on support set
-                support_outputs = func.functional_call(self.model, (fast_params, buffers), support_batch_device)
+                support_outputs = func.functional_call(self.model, (fast_params, buffers), args=(), kwargs=support_batch_device)
                 support_loss = support_outputs['loss']
                 
                 # Compute gradients for the inner loop
@@ -371,7 +371,7 @@ class FOMAML(BaselineMethod):
 
             # Evaluate on the query set with the adapted parameters
             query_batch_device = utils.move_to_device(query_batch, self.device)
-            query_outputs = func.functional_call(self.model, (fast_params, buffers), query_batch_device)
+            query_outputs = func.functional_call(self.model, (fast_params, buffers), args=(), kwargs=query_batch_device)
             return query_outputs['loss']
 
         # Vectorize the single-task function over the meta-batch dimension (dim 0)
@@ -451,7 +451,7 @@ class Reptile(BaselineMethod):
             total_loss = 0.0
             for _ in range(self.inner_steps):
                 support_batch_device = utils.move_to_device(support_batch, self.device)
-                support_outputs = func.functional_call(self.model, (fast_params, buffers), support_batch_device)
+                support_outputs = func.functional_call(self.model, (fast_params, buffers), args=(), kwargs=support_batch_device)
                 loss = support_outputs['loss']
                 grads = torch.autograd.grad(loss, list(fast_params.values()), allow_unused=True)
                 fast_params = {

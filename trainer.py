@@ -169,7 +169,7 @@ class MELoRATrainer:
             fast_params = params
             for _ in range(self.inner_steps):
                 support_batch_device = utils.move_to_device(support_batch, self.device)
-                support_outputs = func.functional_call(self.model, (fast_params, buffers), support_batch_device)
+                support_outputs = func.functional_call(self.model, (fast_params, buffers), args=(), kwargs=support_batch_device)
                 
                 inner_loss = support_outputs['loss']
                 if self.lora_config['regularization_weight'] > 0:
@@ -185,7 +185,7 @@ class MELoRATrainer:
             
             # Evaluate on query set
             query_batch_device = utils.move_to_device(query_batch, self.device)
-            query_outputs = func.functional_call(self.model, (fast_params, buffers), query_batch_device)
+            query_outputs = func.functional_call(self.model, (fast_params, buffers), args=(), kwargs=query_batch_device)
             task_query_loss = query_outputs['loss']
 
             task_lora_reg_loss = torch.tensor(0.0, device=self.device)
