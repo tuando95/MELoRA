@@ -175,7 +175,7 @@ class MELoRATrainer:
         inner_steps_local = self.inner_steps
         device_local = self.device
         model_local = self.model
-        grad_clip_norm_local = self.config['training']['grad_clip_norm']
+        grad_clip_norm_local = self.config['training']['regularization']['gradient_clipping']
 
         def melora_single_task_loss(params, buffers, support_batch, query_batch):
             # This is a static helper function now, as it doesn't depend on `self`
