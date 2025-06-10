@@ -32,8 +32,20 @@ class Visualizer:
         os.makedirs(self.save_path, exist_ok=True)
         
         # Set style
-        plt.style.use(self.viz_config['style'])
-        sns.set_palette("husl")
+        style = self.viz_config['style']
+        if style == 'seaborn':
+            # Use seaborn style settings via seaborn, not matplotlib
+            sns.set_style("whitegrid")
+            sns.set_palette("husl")
+        else:
+            # Use matplotlib style
+            try:
+                plt.style.use(style)
+            except OSError:
+                # Fallback to default if style not available
+                self.logger.warning(f"Style '{style}' not available, using default")
+                plt.style.use('default')
+            sns.set_palette("husl")
         
         # Set default figure size
         self.figsize = tuple(self.viz_config['figure_size'])

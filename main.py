@@ -208,6 +208,7 @@ def train_melora(config: Dict,
 def evaluate_methods(config: Dict,
                     model: MELoRAModel,
                     dataset_loader: DatasetLoader,
+                    datasets: Dict[str, List],
                     test_tasks: List[Tuple[List, List]],
                     args) -> Dict[str, Dict[str, Any]]:
     """Evaluate MELoRA and baseline methods."""
@@ -386,7 +387,7 @@ def main():
         # Evaluation mode
         if args.mode in ['evaluate', 'full']:
             results = evaluate_methods(
-                config, model, dataset_loader, datasets['test'], args
+                config, model, dataset_loader, datasets, datasets['test'], args
             )
             
             # Save comparison results
