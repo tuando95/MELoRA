@@ -104,7 +104,7 @@ meta_learning:
     
   # Batch configuration
   meta_batch_sizes: [4, 8, 16]  # Number of tasks per meta-update
-  default_meta_batch_size: 16  # Reduced from 8 for speed
+  default_meta_batch_size: 8  # Reduced from 16 to prevent OOM
   
   # Training iterations
   num_meta_iterations: 100  # Reduced from 10000 for testing
@@ -215,8 +215,8 @@ datasets:
   # Few-shot configuration
   few_shot:
     k_shot_options: [5, 10, 20]  # Number of examples per class
-    default_k_shot: 16  # Reduced from 10
-    query_set_size: 32  # Reduced from 100
+    default_k_shot: 8  # Reduced from 16
+    query_set_size: 16  # Reduced from 32
     num_tasks_train: 100  # Reduced from 1000
     num_tasks_val: 20   # Reduced from 200
     num_tasks_test: 20  # Reduced from 200
