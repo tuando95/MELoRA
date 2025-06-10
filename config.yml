@@ -1,0 +1,518 @@
+# MELoRA (Memory-Efficient LoRA Meta-Learning) Configuration
+
+# Experiment Settings
+experiment:
+  name: "melora_experiment"
+  description: "Memory-Efficient LoRA Meta-Learning for Few-Shot NLP"
+  seed: 42
+  num_seeds: 5  # Number of random seeds for statistical robustness
+  output_dir: "./experiments"
+  log_dir: "./logs"
+  checkpoint_dir: "./checkpoints"
+  use_mlflow: true
+  mlflow_uri: "file:./mlruns"
+  device: "cuda"  # cuda or cpu
+  mixed_precision: true  # Use FP16 for memory efficiency
+  deterministic: true  # For reproducibility
+  verbose: true
+
+# Model Configuration
+models:
+  available_models:
+    - name: "gpt2-small"
+      type: "gpt2"
+      pretrained: "gpt2"
+      num_params: 124000000
+      num_layers: 12
+      hidden_size: 768
+      num_heads: 12
+      max_length: 512
+    
+    - name: "gpt2-medium"
+      type: "gpt2"
+      pretrained: "gpt2-medium"
+      num_params: 355000000
+      num_layers: 24
+      hidden_size: 1024
+      num_heads: 16
+      max_length: 512
+    
+    - name: "t5-small"
+      type: "t5"
+      pretrained: "t5-small"
+      num_params: 60000000
+      num_layers: 6  # encoder + decoder
+      hidden_size: 512
+      num_heads: 8
+      max_length: 512
+    
+    - name: "t5-base"
+      type: "t5"
+      pretrained: "t5-base"
+      num_params: 220000000
+      num_layers: 12  # encoder + decoder
+      hidden_size: 768
+      num_heads: 12
+      max_length: 512
+    
+    - name: "distilbert"
+      type: "bert"
+      pretrained: "distilbert-base-uncased"
+      num_params: 66000000
+      num_layers: 6
+      hidden_size: 768
+      num_heads: 12
+      max_length: 512
+  
+  selected_model: "gpt2-small"  # Default model for experiments
+
+# LoRA Configuration
+lora:
+  ranks: [4, 8, 16, 32]  # List of ranks to experiment with
+  default_rank: 8
+  alpha: null  # If null, alpha = rank (following Hu et al., 2021)
+  dropout: 0.1
+  target_modules:  # Modules to apply LoRA
+    gpt2: ["attn.c_attn", "attn.c_proj", "mlp.c_fc", "mlp.c_proj"]
+    t5: ["q", "k", "v", "o"]
+    bert: ["query", "key", "value", "output.dense"]
+  bias: "none"  # none, all, or lora_only
+  init_lora_weights: true  # Initialize A with Gaussian, B with zeros
+  scaling_factor: 1.0
+
+# Meta-Learning Configuration
+meta_learning:
+  algorithm: "maml"  # maml, fomaml, reptile
+  
+  # Inner loop (task adaptation)
+  inner:
+    learning_rates: [0.001, 0.005, 0.01, 0.02]  # Grid search values
+    default_lr: 0.01
+    num_steps_options: [1, 3, 5]  # K-step adaptation
+    default_num_steps: 1  # Reduced from 3 for speed
+    optimizer: "sgd"  # sgd or adam for inner loop
+    
+  # Outer loop (meta-update)
+  outer:
+    learning_rates: [0.0001, 0.0005, 0.001, 0.002]  # Grid search values
+    default_lr: 0.001  # Increased for faster convergence
+    optimizer: "adamw"
+    optimizer_params:
+      betas: [0.9, 0.999]
+      eps: 0.00000001
+      weight_decay: 0.0001
+    
+  # Batch configuration
+  meta_batch_sizes: [4, 8, 16]  # Number of tasks per meta-update
+  default_meta_batch_size: 4  # Reduced from 8 for speed
+  
+  # Training iterations
+  num_meta_iterations: 100  # Reduced from 10000 for testing
+  validation_frequency: 20  # Validate more frequently
+  checkpoint_frequency: 50  # Checkpoint more frequently
+
+# Memory Optimization Configuration
+memory_optimization:
+  # Gradient Accumulation
+  gradient_accumulation:
+    enabled: true
+    micro_batch_sizes: [2, 4, 8]  # Micro-batch for memory reduction
+    default_micro_batch: 2  # Reduced from 4
+  
+  # Selective Checkpointing
+  checkpointing:
+    enabled: false  # Disable for debugging
+    strategy: "selective"  # selective, full, or none
+    checkpoint_frequency: 2  # Checkpoint every N layers
+    checkpoint_lora_only: true  # Only checkpoint LoRA layers
+  
+  # Hessian Approximation
+  hessian_approximation:
+    enabled: false  # Disable second-order for speed
+    method: "diagonal"  # diagonal, gauss_newton, block_diagonal, or none
+    hutchinson_samples: 10  # For diagonal estimation
+    low_rank_hessian: 32  # Rank for low-rank approximation
+  
+  # Memory Management
+  memory_limits:
+    max_gpu_memory_mb: 8192  # 8GB limit for consumer GPUs
+    reserve_memory_mb: 512  # Reserved for system
+    enable_cpu_offload: false
+    gradient_checkpointing: true
+  
+  # Mixed Precision
+  mixed_precision:
+    enabled: true
+    opt_level: "O1"  # O0, O1, O2, O3 (Apex optimization levels)
+    loss_scale: "dynamic"
+
+# Dataset Configuration
+datasets:
+  # GLUE Tasks
+  glue:
+    enabled: true
+    tasks:
+      - name: "sst2"
+        type: "classification"
+        num_classes: 2
+        metric: "accuracy"
+        max_length: 128
+      
+      - name: "mnli"
+        type: "classification"
+        num_classes: 3
+        metric: "accuracy"
+        max_length: 256
+      
+      - name: "qqp"
+        type: "classification"
+        num_classes: 2
+        metric: ["accuracy", "f1"]
+        max_length: 256
+      
+      - name: "rte"
+        type: "classification"
+        num_classes: 2
+        metric: "accuracy"
+        max_length: 256
+  
+  # SuperGLUE Tasks
+  superglue:
+    enabled: true
+    tasks:
+      - name: "boolq"
+        type: "classification"
+        num_classes: 2
+        metric: "accuracy"
+        max_length: 512
+      
+      - name: "cb"
+        type: "classification"
+        num_classes: 3
+        metric: ["accuracy", "f1"]
+        max_length: 256
+      
+      - name: "wic"
+        type: "classification"
+        num_classes: 2
+        metric: "accuracy"
+        max_length: 256
+  
+  # KILT Tasks
+  kilt:
+    enabled: false  # Disabled by default due to size
+    tasks:
+      - name: "natural_questions"
+        type: "qa"
+        metric: ["exact_match", "f1"]
+        max_length: 512
+      
+      - name: "triviaqa"
+        type: "qa"
+        metric: ["exact_match", "f1"]
+        max_length: 512
+  
+  # Few-shot configuration
+  few_shot:
+    k_shot_options: [5, 10, 20]  # Number of examples per class
+    default_k_shot: 5  # Reduced from 10
+    query_set_size: 50  # Reduced from 100
+    num_tasks_train: 100  # Reduced from 1000
+    num_tasks_val: 20   # Reduced from 200
+    num_tasks_test: 20  # Reduced from 200
+    stratified_sampling: true
+    seed: 42
+
+# Synthetic Data Generation
+synthetic_data:
+  enabled: true  # Enable for faster loading
+  
+  # Task generation parameters
+  task_generation:
+    vocab_size: 1000
+    embedding_dim: 128
+    sequence_lengths: [32, 64, 128, 256]
+    default_seq_length: 64
+    num_classes_options: [2, 3, 5]
+    default_num_classes: 2
+  
+  # Task distribution parameters
+  task_distribution:
+    task_similarity_sigmas: [0.1, 0.5, 1.0]  # Controls inter-task variance
+    default_similarity: 0.5
+    task_difficulty_betas: [0.1, 0.5, 1.0]  # Controls input-label correlation
+    default_difficulty: 0.5
+    linear_separability: 0.7  # Gamma parameter
+  
+  # Generation settings
+  num_synthetic_tasks: 500
+  validation_split: 0.2
+  test_split: 0.2
+
+# Training Configuration
+training:
+  # Optimization
+  optimizer:
+    type: "adamw"
+    learning_rate: 0.001
+    betas: [0.9, 0.999]
+    eps: 0.00000001
+    weight_decay: 0.0001
+    amsgrad: false
+  
+  # Learning Rate Scheduling
+  scheduler:
+    type: "cosine"  # constant, linear, cosine, polynomial
+    warmup_steps: 500
+    warmup_ratio: 0.1
+    num_cycles: 0.5  # For cosine scheduler
+    power: 1.0  # For polynomial scheduler
+  
+  # Regularization
+  regularization:
+    dropout: 0.1
+    attention_dropout: 0.1
+    hidden_dropout: 0.1
+    gradient_clipping: 1.0
+    gradient_norm_type: 2
+    label_smoothing: 0.0
+  
+  # Early Stopping
+  early_stopping:
+    enabled: true
+    patience: 50  # Meta-iterations
+    min_delta: 0.0001
+    monitor: "val_loss"
+    mode: "min"
+  
+  # Training Control
+  max_epochs: 100
+  log_interval: 10
+  eval_interval: 100
+  save_interval: 500
+  num_workers: 4
+  pin_memory: true
+
+# Evaluation Configuration
+evaluation:
+  # Metrics
+  metrics:
+    classification: ["accuracy", "precision", "recall", "f1_macro", "f1_micro"]
+    qa: ["exact_match", "f1", "bleu", "rouge_l"]
+    generation: ["bleu", "rouge_l", "bertscore"]
+  
+  # Memory Profiling
+  memory_profiling:
+    enabled: true
+    profile_interval: 10  # Profile every N iterations
+    detailed_breakdown: true
+    components: ["activations", "parameters", "gradients", "optimizer_states"]
+    use_nvidia_smi: true
+    use_torch_profiler: true
+  
+  # Evaluation Protocol
+  protocol:
+    num_eval_episodes: 100
+    bootstrap_samples: 1000
+    confidence_level: 0.95
+    use_paired_tests: true
+    multiple_comparison_correction: "bonferroni"
+  
+  # Computational Efficiency
+  efficiency_metrics:
+    measure_flops: true
+    measure_energy: true
+    measure_latency: true
+    measure_throughput: true
+
+# Baseline Methods Configuration
+baselines:
+  methods:
+    - name: "full_maml"
+      enabled: false  # May not fit in memory
+      config:
+        inner_lr: 0.01
+        outer_lr: 0.001
+        inner_steps: 5
+    
+    - name: "fomaml"
+      enabled: true
+      config:
+        inner_lr: 0.01
+        outer_lr: 0.001
+        inner_steps: 5
+    
+    - name: "reptile"
+      enabled: true
+      config:
+        lr: 0.001
+        inner_steps: 5
+        epsilon: 0.1
+    
+    - name: "fine_tuning"
+      enabled: true
+      config:
+        lr: 0.001
+        epochs: 10
+    
+    - name: "lora_fine_tuning"
+      enabled: true
+      config:
+        lr: 0.001
+        rank: 8
+        epochs: 10
+    
+    - name: "prototypical_networks"
+      enabled: true
+      config:
+        embedding_dim: 128
+
+# Hardware Configuration
+hardware:
+  # GPU Settings
+  gpu:
+    device_ids: [0]  # List of GPU IDs to use
+    primary_gpu: "NVIDIA RTX 3080"
+    memory_gb: 10
+    allow_growth: true
+    per_process_memory_fraction: 0.9
+  
+  # CPU Settings
+  cpu:
+    num_threads: 8
+    use_mkl: true
+    use_openmp: true
+  
+  # Distributed Training (if applicable)
+  distributed:
+    enabled: false
+    backend: "nccl"
+    world_size: 1
+    rank: 0
+
+# Hyperparameter Search Configuration
+hyperparameter_search:
+  enabled: true
+  method: "bayesian"  # grid, random, bayesian
+  
+  # Search Space
+  search_space:
+    lora_rank: [4, 8, 16, 32]
+    inner_lr: [0.001, 0.005, 0.01, 0.02]
+    outer_lr: [0.0001, 0.0005, 0.001]
+    inner_steps: [1, 3, 5]
+    micro_batch_size: [2, 4, 8]
+    hessian_samples: [5, 10, 20]
+  
+  # Bayesian Optimization
+  bayesian_config:
+    n_initial_points: 20
+    n_calls: 100
+    acq_func: "EI"  # Expected Improvement
+    xi: 0.01
+    kappa: 1.96
+    n_jobs: 4
+  
+  # Cross-validation
+  cross_validation:
+    n_folds: 5
+    stratified: true
+
+# Visualization Configuration
+visualization:
+  enabled: true
+  
+  # Plot Types
+  plots:
+    - type: "learning_curves"
+      save_format: ["png", "pdf"]
+      dpi: 300
+    
+    - type: "memory_usage"
+      real_time: true
+      window_size: 100
+    
+    - type: "parameter_trajectories"
+      use_tsne: true
+      perplexity: 30
+    
+    - type: "pareto_frontier"
+      metrics: ["memory", "performance"]
+    
+    - type: "attention_heatmaps"
+      layers: ["all"]
+      save_examples: 10
+  
+  # Visualization Settings
+  style: "seaborn"
+  figure_size: [10, 8]
+  font_size: 12
+  save_path: "./visualizations"
+
+# Analysis Configuration
+analysis:
+  # Error Analysis
+  error_analysis:
+    enabled: true
+    save_misclassified: true
+    num_examples: 100
+    analyze_confidence: true
+  
+  # Ablation Studies
+  ablation:
+    components: ["checkpointing", "hessian", "gradient_accumulation", "lora_rank"]
+    interaction_analysis: true
+    sensitivity_analysis: true
+  
+  # Statistical Analysis
+  statistics:
+    test_type: "paired_t_test"
+    effect_size: "cohen_d"
+    power_analysis: true
+    bootstrap_ci: true
+  
+  # Report Generation
+  report:
+    format: ["html", "latex", "markdown"]
+    include_tables: true
+    include_figures: true
+    summary_statistics: true
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  # File Logging
+  file:
+    enabled: true
+    path: "./logs/melora.log"
+    max_size_mb: 100
+    backup_count: 5
+  
+  # Console Logging
+  console:
+    enabled: true
+    colorize: true
+  
+  # Tensorboard
+  tensorboard:
+    enabled: true
+    log_dir: "./runs"
+    flush_secs: 30
+  
+  # Weights & Biases
+  wandb:
+    enabled: false
+    project: "melora"
+    entity: null
+    tags: ["meta-learning", "lora", "memory-efficient"]
+
+# Reproducibility Configuration
+reproducibility:
+  seed: 42
+  cuda_deterministic: true
+  cuda_benchmark: false
+  numpy_seed: 42
+  torch_seed: 42
+  random_seed: 42 

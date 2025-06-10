@@ -1,0 +1,149 @@
+# MELoRA Project .gitignore
+
+# Results and Logs
+results/
+logs/
+outputs/
+checkpoints/
+experiments/
+runs/
+wandb/
+mlruns/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyTorch and ML
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.joblib
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Environment variables
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Data directories (uncomment if you don't want to track datasets)
+# data/
+# datasets/
+
+# Cache directories
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Documentation builds
+docs/_build/
+.readthedocs.yml
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# MLflow tracking
+mlruns/
+.mlflow/
+
+# TensorBoard logs
+tensorboard_logs/
+tb_logs/
+
+# Weights & Biases
+wandb/
+
+# Model artifacts
+models/
+saved_models/
+pretrained/
+
+# Generated files
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.svg
+generated/
+
+# Configuration overrides (keep template configs)
+config_local.yml
+config_override.yml
+
+# Profiling results
+*.prof
+*.profile
+
+# Memory dumps
+*.dmp
+
+# Test outputs
+test_outputs/
+test_results/
+
+# Benchmark results
+benchmarks/results/
+
+# Large files (use Git LFS if needed)
+*.zip
+*.tar.gz
+*.tar.bz2
+*.rar
+*.7z 
