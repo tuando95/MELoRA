@@ -155,11 +155,21 @@ def log_metrics(metrics: Dict[str, float],
     # Log to TensorBoard
     if _tensorboard_writer is not None:
         for key, value in metrics.items():
-            _tensorboard_writer.add_scalar(key, value, step)
+            # Only log numeric values to TensorBoard
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                _tensorboard_writer.add_scalar(key, value, step)
+            else:
+                # Skip non-numeric values but log a warning
+                logger = get_logger()
+                logger.debug(f"Skipping non-numeric metric for TensorBoard: {key}={value}")
     
     # Log to MLflow
     if _mlflow_run is not None:
-        mlflow.log_metrics(metrics, step)
+        # Filter numeric metrics for MLflow as well
+        numeric_metrics = {k: v for k, v in metrics.items() 
+                          if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        if numeric_metrics:
+            mlflow.log_metrics(numeric_metrics, step)
 
 
 def save_results(results: Dict[str, Any], 

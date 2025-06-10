@@ -124,7 +124,10 @@ class MELoRATrainer:
                 
                 # Add memory metrics
                 memory_stats = self.memory_profiler.profile_memory(f'iter_{iteration}')
-                metrics.update({f'memory/{k}': v for k, v in memory_stats.items()})
+                # Only add numeric memory stats to metrics (exclude 'tag' and 'timestamp')
+                numeric_memory_stats = {k: v for k, v in memory_stats.items() 
+                                      if isinstance(v, (int, float)) and k not in ['tag', 'timestamp']}
+                metrics.update({f'memory/{k}': v for k, v in numeric_memory_stats.items()})
                 
                 utils.log_metrics(metrics, iteration, prefix='train')
                 
