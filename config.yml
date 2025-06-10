@@ -104,7 +104,7 @@ meta_learning:
     
   # Batch configuration
   meta_batch_sizes: [4, 8, 16]  # Number of tasks per meta-update
-  default_meta_batch_size: 8  # Reduced from 8 for speed
+  default_meta_batch_size: 16  # Reduced from 8 for speed
   
   # Training iterations
   num_meta_iterations: 100  # Reduced from 10000 for testing
@@ -290,7 +290,7 @@ training:
   log_interval: 10
   eval_interval: 100
   save_interval: 500
-  num_workers: 4
+  num_workers: 16
   pin_memory: true
 
 # Evaluation Configuration
@@ -338,9 +338,9 @@ baselines:
     - name: "fomaml"
       enabled: true
       config:
-        inner_lr: 0.01
-        outer_lr: 0.001
-        inner_steps: 5
+        inner_lr: 0.001
+        outer_lr: 0.0001
+        inner_steps: 1
     
     - name: "reptile"
       enabled: true

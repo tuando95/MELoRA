@@ -1,6 +1,14 @@
 """
 Baseline implementations for comparative evaluation.
 Includes MAML, FOMAML, Reptile, and standard fine-tuning baselines.
+
+Memory Requirements Summary:
+- FullMAML: HIGH (16GB+ GPU) - Second-order gradients with computation graph retention
+- FOMAML: MODERATE (8GB+ GPU) - First-order approximation, 50-70% less memory than FullMAML
+- Reptile: LOW (4GB+ GPU) - Most memory efficient, only stores initial/final parameters
+- Standard Fine-tuning: LOW (4GB+ GPU) - No meta-learning overhead
+
+See memory_requirements.md for detailed analysis and optimization strategies.
 """
 
 import copy
@@ -235,36 +243,17 @@ class FullMAML(BaselineMethod):
         return outputs
         
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
-        """Evaluate on test tasks."""
-        self.model.eval()
-        total_loss = 0.0
-        total_accuracy = 0.0
+        """Evaluate on test tasks using same protocol as MELoRA."""
+        from evaluation import Evaluator
         
-        for support_set, query_set in test_tasks:
-            # Adapt to support set
-            adapted_model = self._adapt_to_task(support_set)
-            
-            # Evaluate on query set
-            query_loader = self.dataset_loader.get_data_loader(
-                query_set, batch_size=len(query_set)
-            )
-            
-            for batch in query_loader:
-                batch = utils.move_to_device(batch, self.device)
-                
-                with torch.no_grad():
-                    outputs = adapted_model(**batch)
-                    loss = outputs['loss']
-                    logits = outputs['logits']
-                    
-                total_loss += loss.item()
-                predictions = torch.argmax(logits, dim=1)
-                accuracy = (predictions == batch['labels']).float().mean()
-                total_accuracy += accuracy.item()
-                
+        # Use MELoRA's evaluation protocol for fair comparison
+        evaluator = Evaluator(self.model, self.config, self.dataset_loader)
+        results = evaluator.evaluate_meta_learning(test_tasks)
+        
+        # Extract the metrics that baselines expect
         return {
-            'test_loss': total_loss / len(test_tasks),
-            'test_accuracy': total_accuracy / len(test_tasks)
+            'test_loss': results.get('loss_mean', 0.0),
+            'test_accuracy': results.get('accuracy_mean', 0.0)
         }
     
     def _adapt_to_task(self, support_set: List[Dict]) -> nn.Module:
@@ -417,56 +406,17 @@ class FOMAML(BaselineMethod):
         return self._evaluate_common(test_tasks)
     
     def _evaluate_common(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
-        """Common evaluation logic."""
-        self.model.eval()
-        total_loss = 0.0
-        total_accuracy = 0.0
+        """Common evaluation logic using same protocol as MELoRA."""
+        from evaluation import Evaluator
         
-        for support_set, query_set in tqdm(test_tasks, desc="Evaluating"):
-            # Clone model for adaptation
-            adapted_model = copy.deepcopy(self.model)
-            optimizer = torch.optim.SGD(
-                adapted_model.get_lora_parameters(), lr=self.inner_lr
-            )
-            
-            # Adapt to support set
-            adapted_model.train()
-            for _ in range(self.inner_steps):
-                support_loader = self.dataset_loader.get_data_loader(
-                    support_set, batch_size=len(support_set)
-                )
-                
-                for batch in support_loader:
-                    batch = utils.move_to_device(batch, self.device)
-                    outputs = adapted_model(**batch)
-                    loss = outputs['loss']
-                    
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    
-            # Evaluate on query set
-            adapted_model.eval()
-            query_loader = self.dataset_loader.get_data_loader(
-                query_set, batch_size=len(query_set)
-            )
-            
-            for batch in query_loader:
-                batch = utils.move_to_device(batch, self.device)
-                
-                with torch.no_grad():
-                    outputs = adapted_model(**batch)
-                    loss = outputs['loss']
-                    logits = outputs['logits']
-                    
-                total_loss += loss.item()
-                predictions = torch.argmax(logits, dim=1)
-                accuracy = (predictions == batch['labels']).float().mean()
-                total_accuracy += accuracy.item()
-                
+        # Use MELoRA's evaluation protocol for fair comparison
+        evaluator = Evaluator(self.model, self.config, self.dataset_loader)
+        results = evaluator.evaluate_meta_learning(test_tasks)
+        
+        # Extract the metrics that baselines expect
         return {
-            'test_loss': total_loss / len(test_tasks),
-            'test_accuracy': total_accuracy / len(test_tasks)
+            'test_loss': results.get('loss_mean', 0.0),
+            'test_accuracy': results.get('accuracy_mean', 0.0)
         }
 
 
@@ -538,8 +488,23 @@ class Reptile(BaselineMethod):
                 self.logger.info(f"Validation: {val_metrics}")
                 
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
-        """Evaluate on test tasks."""
-        return FOMAML._evaluate_common(self, test_tasks)
+        """Evaluate on test tasks using the unified evaluation protocol."""
+        from evaluation import Evaluator
+        
+        # Use MELoRA's evaluation protocol for a fair comparison, 
+        # using Reptile's own learning rate for adaptation.
+        evaluator = Evaluator(self.model, self.config, self.dataset_loader)
+        results = evaluator.evaluate_meta_learning(
+            test_tasks,
+            adaptation_steps=self.inner_steps,
+            adaptation_lr=self.lr
+        )
+        
+        # Extract the metrics that baselines expect
+        return {
+            'test_loss': results.get('loss_mean', 0.0),
+            'test_accuracy': results.get('accuracy_mean', 0.0)
+        }
 
 
 class StandardFineTuning(BaselineMethod):
@@ -558,53 +523,22 @@ class StandardFineTuning(BaselineMethod):
         self.logger.info("Model will be adapted from scratch for each test task")
         
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
-        """Evaluate by fine-tuning from scratch on each task."""
-        total_loss = 0.0
-        total_accuracy = 0.0
+        """Evaluate by fine-tuning from scratch using same protocol as MELoRA."""
+        from evaluation import Evaluator
         
-        for support_set, query_set in tqdm(test_tasks, desc="Fine-tuning"):
-            # Reset model to pre-trained weights
-            adapted_model = copy.deepcopy(self.model)
-            optimizer = torch.optim.Adam(adapted_model.get_lora_parameters(), lr=self.lr)
-            
-            # Fine-tune on support set
-            adapted_model.train()
-            for epoch in range(self.epochs):
-                support_loader = self.dataset_loader.get_data_loader(
-                    support_set, batch_size=len(support_set)
-                )
-                
-                for batch in support_loader:
-                    batch = utils.move_to_device(batch, self.device)
-                    outputs = adapted_model(**batch)
-                    loss = outputs['loss']
-                    
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    
-            # Evaluate on query set
-            adapted_model.eval()
-            query_loader = self.dataset_loader.get_data_loader(
-                query_set, batch_size=len(query_set)
-            )
-            
-            for batch in query_loader:
-                batch = utils.move_to_device(batch, self.device)
-                
-                with torch.no_grad():
-                    outputs = adapted_model(**batch)
-                    loss = outputs['loss']
-                    logits = outputs['logits']
-                    
-                total_loss += loss.item()
-                predictions = torch.argmax(logits, dim=1)
-                accuracy = (predictions == batch['labels']).float().mean()
-                total_accuracy += accuracy.item()
-                
+        # Use MELoRA's evaluation protocol for fair comparison
+        # But with more epochs for fine-tuning instead of few-shot adaptation
+        evaluator = Evaluator(self.model, self.config, self.dataset_loader)
+        results = evaluator.evaluate_meta_learning(
+            test_tasks, 
+            adaptation_steps=self.epochs,  # Use epochs for adaptation
+            adaptation_lr=self.lr
+        )
+        
+        # Extract the metrics that baselines expect
         return {
-            'test_loss': total_loss / len(test_tasks),
-            'test_accuracy': total_accuracy / len(test_tasks)
+            'test_loss': results.get('loss_mean', 0.0),
+            'test_accuracy': results.get('accuracy_mean', 0.0)
         }
 
 
