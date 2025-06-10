@@ -15,6 +15,8 @@ from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
+from torch.utils.checkpoint import checkpoint
+import torch.func as func
 
 from model import MELoRAModel
 from dataset_loader import DatasetLoader
@@ -82,182 +84,106 @@ class MELoRATrainer:
             
         # Inner loop optimizer is created per task
         
-    def train(self, 
-              meta_train_tasks: List[Tuple[List, List]],
-              meta_val_tasks: Optional[List[Tuple[List, List]]] = None,
-              num_iterations: Optional[int] = None):
-        """Main training loop for meta-learning."""
-        if num_iterations is None:
-            num_iterations = self.meta_config['num_meta_iterations']
-            
-        self.logger.info(f"Starting MELoRA training for {num_iterations} iterations")
-        self.logger.info(f"Meta-batch size: {self.meta_batch_size}")
-        self.logger.info(f"Inner steps: {self.inner_steps}, Inner LR: {self.inner_lr}")
+    def _get_task_tensors(self, task_list):
+        """Collates a list of tasks into batched tensors for vmap."""
+        support_tensors, query_tensors = [], []
+        for support_set, query_set in task_list:
+            support_loader = self.dataset_loader.get_data_loader(
+                support_set, batch_size=len(support_set), shuffle=False)
+            query_loader = self.dataset_loader.get_data_loader(
+                query_set, batch_size=len(query_set), shuffle=False)
+            support_tensors.append(next(iter(support_loader)))
+            query_tensors.append(next(iter(query_loader)))
+
+        collated_support = {k: torch.stack([s[k] for s in support_tensors]) for k in support_tensors[0]}
+        collated_query = {k: torch.stack([q[k] for q in query_tensors]) for k in query_tensors[0]}
+        return collated_support, collated_query
+
+    def train(self, meta_train_tasks: List, meta_val_tasks: Optional[List] = None, num_iterations: Optional[int] = None):
+        """Train the MELoRA model using a parallelized vmap approach."""
+        num_iterations = num_iterations or self.meta_config['num_meta_iterations']
         
-        # Log initial memory usage
-        initial_memory = self.memory_profiler.profile_memory('initial')
-        self.logger.info(f"Initial memory: {initial_memory}")
-        
-        # Create progress bar for training iterations
-        pbar = tqdm(range(num_iterations), desc="MELoRA Training", 
-                   bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}')
-        
+        self.logger.info("Starting Parallelized MELoRA training (vmap)")
+        pbar = tqdm(range(num_iterations), desc="MELoRA Training (vmap)")
+
         for iteration in pbar:
-            # Sample meta-batch of tasks
-            task_batch = self._sample_task_batch(meta_train_tasks)
+            self.model.train()
+            task_indices = np.random.choice(len(meta_train_tasks), self.meta_batch_size, replace=False)
+            task_batch = [meta_train_tasks[i] for i in task_indices]
             
-            # Meta-training step
-            meta_train_loss = self._meta_train_step(task_batch)
+            # Perform one parallel meta-training step
+            meta_loss, query_loss, lora_reg_loss = self._meta_train_step_parallel(task_batch)
             
-            # Update progress bar with current metrics
             pbar.set_postfix({
-                'Loss': f'{meta_train_loss:.4f}',
-                'LR': f'{self.meta_optimizer.param_groups[0]["lr"]:.2e}'
+                'meta_loss': f'{meta_loss:.4f}',
+                'query_loss': f'{query_loss:.4f}',
+                'reg_loss': f'{lora_reg_loss:.4f}'
             })
-            
-            # Logging
+
             if iteration % self.config['training']['log_interval'] == 0:
-                metrics = {
-                    'meta_train_loss': meta_train_loss,
-                    'learning_rate': self.meta_optimizer.param_groups[0]['lr']
-                }
-                
-                # Add memory metrics
-                memory_stats = self.memory_profiler.profile_memory(f'iter_{iteration}')
-                # Only add numeric memory stats to metrics (exclude 'tag' and 'timestamp')
-                numeric_memory_stats = {k: v for k, v in memory_stats.items() 
-                                      if isinstance(v, (int, float)) and k not in ['tag', 'timestamp']}
-                metrics.update({f'memory/{k}': v for k, v in numeric_memory_stats.items()})
-                
-                utils.log_metrics(metrics, iteration, prefix='train')
-                
-            # Validation
-            if meta_val_tasks and iteration % self.meta_config['validation_frequency'] == 0:
-                pbar.set_description("Validating...")
-                val_metrics = self.validate(meta_val_tasks)
-                utils.log_metrics(val_metrics, iteration, prefix='val')
-                
-                # Update progress bar with validation metrics
-                pbar.set_postfix({
-                    'Loss': f'{meta_train_loss:.4f}',
-                    'Val Loss': f'{val_metrics["meta_val_loss"]:.4f}',
-                    'Val Acc': f'{val_metrics["meta_val_accuracy"]:.3f}',
-                    'LR': f'{self.meta_optimizer.param_groups[0]["lr"]:.2e}'
-                })
-                pbar.set_description("MELoRA Training")
-                
-                # Early stopping check
-                if val_metrics['meta_val_loss'] < self.best_val_loss:
-                    self.best_val_loss = val_metrics['meta_val_loss']
-                    self.save_checkpoint(iteration, val_metrics)
-                    
-            # Checkpoint saving
-            if iteration % self.meta_config['checkpoint_frequency'] == 0:
-                self.save_checkpoint(iteration)
-                
-            self.global_step = iteration
-        
-        pbar.close()
-        self.logger.info("Training completed")
-        
-    def _sample_task_batch(self, tasks: List[Tuple[List, List]]) -> List[Tuple[List, List]]:
-        """Sample a batch of tasks for meta-training."""
-        indices = np.random.choice(len(tasks), self.meta_batch_size, replace=True)
-        return [tasks[i] for i in indices]
+                self._log_metrics(iteration, meta_loss, query_loss, lora_reg_loss)
+            
+            if meta_val_tasks and iteration % self.config['training']['eval_interval'] == 0:
+                self._run_validation(meta_val_tasks, iteration)
+            
+            if iteration % self.config['training']['save_interval'] == 0 and iteration > 0:
+                self.save_checkpoint(f"iter_{iteration}.pt")
     
-    def _meta_train_step(self, task_batch: List[Tuple[List, List]]) -> float:
-        """Perform one meta-training step."""
-        self.model.train()
-        
-        # Initialize meta-gradients
-        meta_grads = None
-        total_query_loss = 0.0
-        
-        # Process tasks with gradient accumulation
-        num_micro_batches = len(task_batch) // self.gradient_accumulation_steps
-        
-        # Add progress bar for task processing (only if batch is large enough)
-        if len(task_batch) > 4:
-            task_pbar = tqdm(range(len(task_batch)), desc="Processing tasks", 
-                           leave=False, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}')
-        else:
-            task_pbar = None
-        
-        for micro_batch_idx in range(num_micro_batches):
-            micro_batch_start = micro_batch_idx * self.gradient_accumulation_steps
-            micro_batch_end = min(
-                micro_batch_start + self.gradient_accumulation_steps,
-                len(task_batch)
-            )
+    def _meta_train_step_parallel(self, task_batch: List) -> Tuple[float, float, float]:
+        """A single parallel meta-update step using vmap."""
+        self.meta_optimizer.zero_grad()
+
+        collated_support, collated_query = self._get_task_tensors(task_batch)
+        params = {name: p for name, p in self.model.named_parameters() if p.requires_grad}
+        buffers = {name: b for name, b in self.model.named_buffers()}
+
+        def melora_single_task_loss(params, buffers, support_batch, query_batch):
+            # Inner loop adaptation
+            fast_params = params
+            for _ in range(self.inner_steps):
+                support_batch_device = utils.move_to_device(support_batch, self.device)
+                support_outputs = func.functional_call(self.model, (fast_params, buffers), support_batch_device)
+                
+                inner_loss = support_outputs['loss']
+                if self.lora_config['regularization_weight'] > 0:
+                    lora_params = [p for name, p in fast_params.items() if 'lora' in name]
+                    reg_loss = self._lora_regularization(lora_params)
+                    inner_loss += self.lora_config['regularization_weight'] * reg_loss
+
+                grads = torch.autograd.grad(inner_loss, list(fast_params.values()), allow_unused=True)
+                fast_params = {
+                    name: p - self.inner_lr * g if g is not None else p
+                    for (name, p), g in zip(fast_params.items(), grads)
+                }
             
-            micro_batch_grads = None
-            micro_batch_loss = 0.0
+            # Evaluate on query set
+            query_batch_device = utils.move_to_device(query_batch, self.device)
+            query_outputs = func.functional_call(self.model, (fast_params, buffers), query_batch_device)
+            task_query_loss = query_outputs['loss']
+
+            task_lora_reg_loss = torch.tensor(0.0, device=self.device)
+            if self.lora_config['regularization_weight'] > 0:
+                lora_params = [p for name, p in fast_params.items() if 'lora' in name]
+                task_lora_reg_loss = self._lora_regularization(lora_params)
             
-            for task_idx in range(micro_batch_start, micro_batch_end):
-                support_set, query_set = task_batch[task_idx]
-                
-                # Inner loop adaptation
-                adapted_params = self._inner_loop_adaptation(support_set)
-                
-                # Compute query loss with adapted parameters
-                query_loss = self._compute_query_loss(query_set, adapted_params)
-                
-                # Compute meta-gradients
-                if self.use_hessian_approx and self.hessian_method != 'none':
-                    task_meta_grads = self._compute_second_order_gradients(
-                        support_set, query_set, adapted_params
-                    )
-                else:
-                    # First-order approximation (FOMAML)
-                    task_meta_grads = torch.autograd.grad(
-                        query_loss, 
-                        self.model.get_lora_parameters(),
-                        retain_graph=True,
-                        allow_unused=True
-                    )
-                    
-                    # Handle None gradients for unused parameters
-                    task_meta_grads = [g if g is not None else torch.zeros_like(p) 
-                                     for g, p in zip(task_meta_grads, self.model.get_lora_parameters())]
-                
-                # Accumulate gradients
-                if micro_batch_grads is None:
-                    micro_batch_grads = [g.clone() for g in task_meta_grads]
-                else:
-                    for i, g in enumerate(task_meta_grads):
-                        micro_batch_grads[i] += g
-                
-                micro_batch_loss += query_loss.item()
-                
-                # Update task progress bar
-                if task_pbar is not None:
-                    task_pbar.update(1)
-                    task_pbar.set_postfix({'Loss': f'{query_loss.item():.4f}'})
-                
-            # Average micro-batch gradients
-            for g in micro_batch_grads:
-                g /= (micro_batch_end - micro_batch_start)
-            
-            # Accumulate to meta-gradients
-            if meta_grads is None:
-                meta_grads = micro_batch_grads
-            else:
-                for i, g in enumerate(micro_batch_grads):
-                    meta_grads[i] += g
-                    
-            total_query_loss += micro_batch_loss
-        
-        if task_pbar is not None:
-            task_pbar.close()
-            
-        # Average meta-gradients
-        for g in meta_grads:
-            g /= num_micro_batches
-            
-        # Apply meta-gradients
-        self._apply_meta_gradients(meta_grads)
-        
-        return total_query_loss / len(task_batch)
+            return task_query_loss, task_lora_reg_loss
+
+        # Vectorize over the meta-batch dimension
+        in_dims = (None, None, 0, 0)
+        query_losses, lora_reg_losses = func.vmap(melora_single_task_loss, in_dims=in_dims)(
+            params, buffers, collated_support, collated_query
+        )
+
+        # Aggregate losses and perform the meta-update
+        query_loss = torch.mean(query_losses)
+        lora_reg_loss = torch.mean(lora_reg_losses)
+        meta_loss = query_loss + self.lora_config['regularization_weight'] * lora_reg_loss
+
+        meta_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['training']['grad_clip_norm'])
+        self.meta_optimizer.step()
+
+        return meta_loss.item(), query_loss.item(), lora_reg_loss.item()
     
     def _get_num_classes_from_data(self, data: List[Dict]) -> int:
         """Extract number of classes from task data."""

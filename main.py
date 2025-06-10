@@ -248,11 +248,13 @@ def evaluate_methods(config: Dict,
                     baseline_name, model, config, dataset_loader
                 )
                 
-                # Train baseline if needed
+                # Train baseline if needed, ensuring it uses the *exact same* data as MELoRA.
                 if baseline_name not in ['fine_tuning', 'lora_fine_tuning']:
-                    baseline_model.train(datasets['train'][:100], datasets['val'][:50])
+                    logger.info(f"Training {baseline_name} on the full training and validation sets...")
+                    baseline_model.train(datasets['train'], datasets['val'])
                     
-                # Evaluate baseline
+                # Evaluate baseline on the full test set
+                logger.info(f"Evaluating {baseline_name} on the full test set...")
                 baseline_results = baseline_model.evaluate(test_tasks)
                 results[baseline_name] = baseline_results
                 

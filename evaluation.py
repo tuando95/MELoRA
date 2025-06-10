@@ -8,6 +8,7 @@ import json
 from typing import Dict, List, Tuple, Optional, Any, Union
 from collections import defaultdict
 import time
+import copy
 
 import torch
 import torch.nn as nn
@@ -58,11 +59,18 @@ class Evaluator:
         
         self.logger = utils.get_logger()
         
+        # Store a copy of the initial model state for fine-tuning baseline evaluations
+        self.initial_model_state = copy.deepcopy(self.model.state_dict())
+        
     def evaluate_meta_learning(self,
                              test_tasks: List[Tuple[List, List]],
                              adaptation_steps: Optional[int] = None,
-                             adaptation_lr: Optional[float] = None) -> Dict[str, Any]:
-        """Evaluate meta-learning model on test tasks."""
+                             adaptation_lr: Optional[float] = None,
+                             reset_model_per_task: bool = False) -> Dict[str, Any]:
+        """
+        Evaluate the model on a set of test tasks.
+        Can be used for both meta-learning and fine-tuning evaluation modes.
+        """
         if adaptation_steps is None:
             adaptation_steps = self.config['meta_learning']['inner']['default_num_steps']
         if adaptation_lr is None:
@@ -83,6 +91,10 @@ class Evaluator:
         for task_idx, (support_set, query_set) in enumerate(
             tqdm(test_tasks, desc="Evaluating tasks")
         ):
+            # If in fine-tuning mode, reset the model to its original state for each task
+            if reset_model_per_task:
+                self.model.load_state_dict(self.initial_model_state)
+
             task_metrics = self._evaluate_single_task(
                 support_set, query_set, 
                 adaptation_steps, adaptation_lr,

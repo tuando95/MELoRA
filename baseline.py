@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
+import torch.func as func
 
 from model import MELoRAModel
 from dataset_loader import DatasetLoader
@@ -81,97 +82,58 @@ class FullMAML(BaselineMethod):
         
     def train(self, meta_train_tasks: List[Tuple[List, List]], 
              meta_val_tasks: Optional[List[Tuple[List, List]]] = None):
-        """Train with full MAML (second-order)."""
+        """Train with full MAML using a parallelized vmap approach."""
         num_iterations = self.config['meta_learning']['num_meta_iterations']
         
-        self.logger.info("Starting Full MAML training")
-        self.logger.warning("This method is memory-intensive and may not fit on consumer GPUs")
+        self.logger.info("Starting Parallelized FullMAML training (vmap)")
         
-        pbar = tqdm(range(num_iterations), desc="FullMAML Training")
+        pbar = tqdm(range(num_iterations), desc="FullMAML Training (vmap)")
         for iteration in pbar:
-            # Sample task batch
-            task_indices = np.random.choice(len(meta_train_tasks), 
-                                          self.meta_batch_size, replace=True)
+            task_indices = np.random.choice(len(meta_train_tasks), self.meta_batch_size, replace=False)
             task_batch = [meta_train_tasks[i] for i in task_indices]
             
-            # Meta-training step
-            meta_loss = self._meta_train_step(task_batch)
-            
-            # Update progress bar
+            meta_loss = self._meta_train_step_parallel(task_batch)
             pbar.set_postfix({'loss': f'{meta_loss:.4f}'})
-            
-            # Logging
+
             if iteration % self.config['training']['log_interval'] == 0:
                 self.logger.info(f"Iteration {iteration}: Meta Loss = {meta_loss:.4f}")
-                
-            # Validation
             if meta_val_tasks and iteration % 100 == 0:
                 val_metrics = self.evaluate(meta_val_tasks)
                 self.logger.info(f"Validation: {val_metrics}")
-                
-    def _meta_train_step(self, task_batch: List[Tuple[List, List]]) -> float:
-        """Perform one meta-training step with full second-order gradients."""
-        self.model.train()
+
+    def _meta_train_step_parallel(self, task_batch: List[Tuple[List, List]]) -> float:
+        """A single parallel meta-update step for FullMAML using vmap."""
         self.meta_optimizer.zero_grad()
         
-        total_loss = 0.0
-        
-        for support_set, query_set in task_batch:
-            # Get initial LoRA parameters
-            lora_params = self.model.get_lora_parameters()
-            fast_weights = [p.clone() for p in lora_params]
-            
-            # Create parameter mapping for functional forward
-            param_dict = self._create_param_dict(fast_weights)
-            
-            # Inner loop adaptation
+        collated_support, collated_query = self._get_task_tensors(task_batch)
+        params = {name: p for name, p in self.model.named_parameters()}
+        buffers = {name: b for name, b in self.model.named_buffers()}
+
+        def full_maml_single_task_loss(params, buffers, support_batch, query_batch):
+            fast_params = params
             for _ in range(self.inner_steps):
-                support_loader = self.dataset_loader.get_data_loader(
-                    support_set, batch_size=len(support_set)
-                )
-                
-                for batch in support_loader:
-                    batch = utils.move_to_device(batch, self.device)
-                    
-                    # Forward with fast weights
-                    outputs = self._functional_forward(batch, param_dict)
-                    loss = outputs['loss']
-                    
-                    # Compute gradients
-                    grads = torch.autograd.grad(loss, fast_weights, create_graph=True, allow_unused=True)
-                    
-                    # Handle None gradients for unused parameters
-                    grads = [g if g is not None else torch.zeros_like(w) 
-                            for g, w in zip(grads, fast_weights)]
-                    
-                    # Update fast weights
-                    fast_weights = [w - self.inner_lr * g 
-                                  for w, g in zip(fast_weights, grads)]
-                    
-                    # Update parameter dictionary
-                    param_dict = self._create_param_dict(fast_weights)
-                    
-            # Compute query loss
-            query_loader = self.dataset_loader.get_data_loader(
-                query_set, batch_size=len(query_set)
-            )
+                support_batch_device = utils.move_to_device(support_batch, self.device)
+                support_outputs = func.functional_call(self.model, (fast_params, buffers), support_batch_device)
+                grads = torch.autograd.grad(support_outputs['loss'], list(fast_params.values()), create_graph=True, allow_unused=True)
+                fast_params = {
+                    name: p - self.inner_lr * g if g is not None else p
+                    for (name, p), g in zip(fast_params.items(), grads)
+                }
             
-            for batch in query_loader:
-                batch = utils.move_to_device(batch, self.device)
-                outputs = self._functional_forward(batch, param_dict)
-                query_loss = outputs['loss']
-                total_loss += query_loss
-                
-        # Backward through everything (second-order)
-        total_loss = total_loss / len(task_batch)
-        total_loss.backward()
-        
-        # Gradient clipping
+            query_batch_device = utils.move_to_device(query_batch, self.device)
+            query_outputs = func.functional_call(self.model, (fast_params, buffers), query_batch_device)
+            return query_outputs['loss']
+
+        in_dims = (None, None, 0, 0)
+        query_losses = func.vmap(full_maml_single_task_loss, in_dims=in_dims)(
+            params, buffers, collated_support, collated_query
+        )
+
+        meta_loss = torch.mean(query_losses)
+        meta_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        
         self.meta_optimizer.step()
-        
-        return total_loss.item()
+        return meta_loss.item()
     
     def _create_param_dict(self, fast_weights: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Create parameter dictionary from flat weight list."""
@@ -295,111 +257,114 @@ class FOMAML(BaselineMethod):
             lr=self.outer_lr
         )
         
+    def _functional_forward(self, params, buffers, batch):
+        """
+        A true functional forward pass using functional_call.
+        This version is vmap-compatible.
+        """
+        return func.functional_call(self.model, (params, buffers), (batch,))
+
+    def _get_task_tensors(self, task_list):
+        """Collates a list of tasks into batched tensors for vmap."""
+        support_tensors = []
+        query_tensors = []
+
+        for support_set, query_set in task_list:
+            # Use the existing loader to process one task at a time
+            support_loader = self.dataset_loader.get_data_loader(
+                support_set, batch_size=len(support_set), shuffle=False)
+            query_loader = self.dataset_loader.get_data_loader(
+                query_set, batch_size=len(query_set), shuffle=False)
+
+            support_batch = next(iter(support_loader))
+            query_batch = next(iter(query_loader))
+            
+            support_tensors.append(support_batch)
+            query_tensors.append(query_batch)
+
+        # Stack the tensors from each task along a new 'meta' dimension
+        collated_support = {k: torch.stack([s[k] for s in support_tensors]) for k in support_tensors[0]}
+        collated_query = {k: torch.stack([q[k] for q in query_tensors]) for k in query_tensors[0]}
+
+        return collated_support, collated_query
+
     def train(self, meta_train_tasks: List[Tuple[List, List]], 
              meta_val_tasks: Optional[List[Tuple[List, List]]] = None):
-        """Train with FOMAML (first-order approximation)."""
+        """Train with FOMAML using a parallelized vmap approach."""
         num_iterations = self.config['meta_learning']['num_meta_iterations']
         
-        self.logger.info("Starting FOMAML training")
+        self.logger.info("Starting Parallelized FOMAML training (vmap)")
         
-        pbar = tqdm(range(num_iterations), desc="FOMAML Training")
+        pbar = tqdm(range(num_iterations), desc="FOMAML Training (vmap)")
         for iteration in pbar:
-            # Sample task batch
+            # Sample a batch of tasks
             task_indices = np.random.choice(len(meta_train_tasks), 
-                                          self.meta_batch_size, replace=True)
+                                          self.meta_batch_size, replace=False)
             task_batch = [meta_train_tasks[i] for i in task_indices]
             
-            # Meta-training step
-            meta_loss = self._meta_train_step(task_batch)
+            # Perform one parallel meta-training step
+            meta_loss = self._meta_train_step_parallel(task_batch)
             
-            # Update progress bar
             pbar.set_postfix({'loss': f'{meta_loss:.4f}'})
             
-            # Logging
             if iteration % self.config['training']['log_interval'] == 0:
                 self.logger.info(f"Iteration {iteration}: Meta Loss = {meta_loss:.4f}")
                 
-            # Validation
             if meta_val_tasks and iteration % 100 == 0:
                 val_metrics = self.evaluate(meta_val_tasks)
                 self.logger.info(f"Validation: {val_metrics}")
-                
-    def _meta_train_step(self, task_batch: List[Tuple[List, List]]) -> float:
-        """Perform one meta-training step with first-order approximation."""
-        self.model.train()
+    
+    def _meta_train_step_parallel(self, task_batch: List[Tuple[List, List]]) -> float:
+        """A single parallel meta-update step using vmap."""
         self.meta_optimizer.zero_grad()
-        
-        total_loss = 0.0
-        accumulated_grads = []
-        
-        # Save original parameters once
-        original_params = [p.clone() for p in self.model.get_lora_parameters()]
-        
-        for support_set, query_set in task_batch:
-            # Reset to original parameters for each task
-            for p, orig_p in zip(self.model.get_lora_parameters(), original_params):
-                p.data = orig_p.data.clone()
-            
+
+        # Collate list of tasks into batched tensors
+        collated_support, collated_query = self._get_task_tensors(task_batch)
+
+        # Get functional representations of the model's parameters and buffers
+        params = {name: p for name, p in self.model.named_parameters()}
+        buffers = {name: b for name, b in self.model.named_buffers()}
+
+        # Define the function that processes a single task
+        def fomaml_single_task_loss(params, buffers, support_batch, query_batch):
             # Inner loop adaptation
-            inner_optimizer = torch.optim.SGD(
-                self.model.get_lora_parameters(), lr=self.inner_lr
-            )
-            
+            fast_params = params
             for _ in range(self.inner_steps):
-                support_loader = self.dataset_loader.get_data_loader(
-                    support_set, batch_size=len(support_set)
-                )
+                # Ensure all tensors in the batch are on the correct device
+                support_batch_device = utils.move_to_device(support_batch, self.device)
                 
-                for batch in support_loader:
-                    batch = utils.move_to_device(batch, self.device)
-                    outputs = self.model(**batch)
-                    loss = outputs['loss']
-                    
-                    inner_optimizer.zero_grad()
-                    loss.backward()
-                    inner_optimizer.step()
-                    
-            # Compute query loss at adapted parameters
-            query_loader = self.dataset_loader.get_data_loader(
-                query_set, batch_size=len(query_set)
-            )
-            
-            # Zero grad before computing query loss
-            self.meta_optimizer.zero_grad()
-            
-            for batch in query_loader:
-                batch = utils.move_to_device(batch, self.device)
-                outputs = self.model(**batch)
-                query_loss = outputs['loss']
+                # Compute loss on support set
+                support_outputs = func.functional_call(self.model, (fast_params, buffers), support_batch_device)
+                support_loss = support_outputs['loss']
                 
-                # First-order approximation: compute gradients at adapted params
-                query_loss.backward()
-                total_loss += query_loss.item()
+                # Compute gradients for the inner loop
+                grads = torch.autograd.grad(support_loss, fast_params.values(), allow_unused=True)
                 
-            # Store gradients computed at adapted parameters
-            if len(accumulated_grads) == 0:
-                accumulated_grads = [p.grad.clone() if p.grad is not None else None 
-                                   for p in self.model.get_lora_parameters()]
-            else:
-                for i, p in enumerate(self.model.get_lora_parameters()):
-                    if p.grad is not None:
-                        if accumulated_grads[i] is None:
-                            accumulated_grads[i] = p.grad.clone()
-                        else:
-                            accumulated_grads[i] += p.grad
-                
-        # Restore original parameters before applying gradients
-        for p, orig_p in zip(self.model.get_lora_parameters(), original_params):
-            p.data = orig_p.data
-            
-        # Apply accumulated gradients
-        for p, grad in zip(self.model.get_lora_parameters(), accumulated_grads):
-            if grad is not None:
-                p.grad = grad / len(task_batch)
-                
+                # Update parameters
+                fast_params = {
+                    name: p - self.inner_lr * g if g is not None else p
+                    for (name, p), g in zip(fast_params.items(), grads)
+                }
+
+            # Evaluate on the query set with the adapted parameters
+            query_batch_device = utils.move_to_device(query_batch, self.device)
+            query_outputs = func.functional_call(self.model, (fast_params, buffers), query_batch_device)
+            return query_outputs['loss']
+
+        # Vectorize the single-task function over the meta-batch dimension (dim 0)
+        # We broadcast the params and buffers to each task (in_dims=None)
+        in_dims = (None, None, 0, 0)
+        query_losses = func.vmap(fomaml_single_task_loss, in_dims=in_dims)(
+            params, buffers, collated_support, collated_query
+        )
+
+        # Compute the final meta-loss and update the model
+        meta_loss = torch.mean(query_losses)
+        meta_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.meta_optimizer.step()
-        
-        return total_loss / len(task_batch)
+
+        return meta_loss.item()
     
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
         """Evaluate on test tasks."""
@@ -433,60 +398,68 @@ class Reptile(BaselineMethod):
         
     def train(self, meta_train_tasks: List[Tuple[List, List]], 
              meta_val_tasks: Optional[List[Tuple[List, List]]] = None):
-        """Train with Reptile algorithm."""
+        """Train with Reptile using a parallelized vmap approach."""
         num_iterations = self.config['meta_learning']['num_meta_iterations']
         
-        self.logger.info("Starting Reptile training")
+        self.logger.info("Starting Parallelized Reptile training (vmap)")
         
-        pbar = tqdm(range(num_iterations), desc="Reptile Training")
+        pbar = tqdm(range(num_iterations), desc="Reptile Training (vmap)")
         for iteration in pbar:
-            # Sample task
-            task_idx = np.random.choice(len(meta_train_tasks))
-            support_set, _ = meta_train_tasks[task_idx]
+            task_indices = np.random.choice(len(meta_train_tasks), self.meta_batch_size, replace=False)
+            task_batch = [meta_train_tasks[i] for i in task_indices]
             
-            # Store initial parameters
-            initial_params = [p.clone() for p in self.model.get_lora_parameters()]
-            
-            # Inner loop optimization
-            optimizer = torch.optim.SGD(self.model.get_lora_parameters(), lr=self.lr)
-            
-            total_loss = 0.0
-            num_batches = 0
-            
-            for _ in range(self.inner_steps):
-                support_loader = self.dataset_loader.get_data_loader(
-                    support_set, batch_size=len(support_set)
-                )
-                
-                for batch in support_loader:
-                    batch = utils.move_to_device(batch, self.device)
-                    outputs = self.model(**batch)
-                    loss = outputs['loss']
-                    
-                    total_loss += loss.item()
-                    num_batches += 1
-                    
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    
-            # Reptile update: move towards adapted parameters
-            for p, init_p in zip(self.model.get_lora_parameters(), initial_params):
-                p.data = init_p + self.epsilon * (p.data - init_p)
-                
-            # Update progress bar with average loss
-            avg_loss = total_loss / num_batches if num_batches > 0 else 0
+            avg_loss = self._meta_train_step_parallel(task_batch)
             pbar.set_postfix({'loss': f'{avg_loss:.4f}'})
-                
-            # Logging
+
             if iteration % self.config['training']['log_interval'] == 0:
-                self.logger.info(f"Iteration {iteration}: Loss = {avg_loss:.4f}")
-                
-            # Validation
+                self.logger.info(f"Iteration {iteration}: Avg Inner-Loop Loss = {avg_loss:.4f}")
             if meta_val_tasks and iteration % 100 == 0:
-                val_metrics = self.evaluate(meta_val_tasks[:50])  # Subset for speed
+                val_metrics = self.evaluate(meta_val_tasks)
                 self.logger.info(f"Validation: {val_metrics}")
-                
+
+    def _meta_train_step_parallel(self, task_batch: List[Tuple[List, List]]) -> float:
+        """A single parallel meta-update step for Reptile using vmap."""
+        collated_support, _ = self._get_task_tensors(task_batch)
+        params = {name: p for name, p in self.model.named_parameters()}
+        buffers = {name: b for name, b in self.model.named_buffers()}
+
+        def reptile_single_task_adapt(params, buffers, support_batch):
+            fast_params = params
+            total_loss = 0.0
+            for _ in range(self.inner_steps):
+                support_batch_device = utils.move_to_device(support_batch, self.device)
+                support_outputs = func.functional_call(self.model, (fast_params, buffers), support_batch_device)
+                loss = support_outputs['loss']
+                grads = torch.autograd.grad(loss, list(fast_params.values()), allow_unused=True)
+                fast_params = {
+                    name: p - self.lr * g if g is not None else p
+                    for (name, p), g in zip(fast_params.items(), grads)
+                }
+                total_loss += loss
+            # vmap requires that all returned tensors have a batch dimension.
+            # We return the total loss and the final parameters for this task.
+            return total_loss / self.inner_steps, fast_params
+
+        in_dims = (None, None, 0)
+        # vmap returns adapted_params for each task, stacked along dim 0
+        avg_losses, adapted_params_batch = func.vmap(reptile_single_task_adapt, in_dims=in_dims)(
+            params, buffers, collated_support
+        )
+        
+        # Average the adapted parameters across the meta-batch
+        avg_adapted_params = {
+            name: torch.mean(p_batch, dim=0)
+            for name, p_batch in adapted_params_batch.items()
+        }
+
+        # Perform the Reptile update
+        with torch.no_grad():
+            for name, p in self.model.named_parameters():
+                if p.requires_grad:
+                    p.data = p.data + self.epsilon * (avg_adapted_params[name] - p.data)
+
+        return torch.mean(avg_losses).item()
+
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
         """Evaluate on test tasks using the unified evaluation protocol."""
         from evaluation import Evaluator
@@ -523,19 +496,24 @@ class StandardFineTuning(BaselineMethod):
         self.logger.info("Model will be adapted from scratch for each test task")
         
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
-        """Evaluate by fine-tuning from scratch using same protocol as MELoRA."""
+        """Evaluate by fine-tuning from scratch using the unified Evaluator."""
         from evaluation import Evaluator
         
-        # Use MELoRA's evaluation protocol for fair comparison
-        # But with more epochs for fine-tuning instead of few-shot adaptation
+        # This evaluator uses the model passed to StandardFineTuning, which main.py
+        # now ensures is a fresh, pre-trained model instance.
         evaluator = Evaluator(self.model, self.config, self.dataset_loader)
+        
+        # Call the evaluator with reset_model_per_task=True to ensure
+        # that for each task, we start from the initial pre-trained weights.
+        # Pass the specific epochs and lr for fine-tuning as adaptation parameters.
         results = evaluator.evaluate_meta_learning(
             test_tasks, 
-            adaptation_steps=self.epochs,  # Use epochs for adaptation
-            adaptation_lr=self.lr
+            adaptation_steps=self.epochs,
+            adaptation_lr=self.lr,
+            reset_model_per_task=True
         )
         
-        # Extract the metrics that baselines expect
+        # Extract and return the primary metrics for comparison
         return {
             'test_loss': results.get('loss_mean', 0.0),
             'test_accuracy': results.get('accuracy_mean', 0.0)

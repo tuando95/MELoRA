@@ -215,8 +215,8 @@ datasets:
   # Few-shot configuration
   few_shot:
     k_shot_options: [5, 10, 20]  # Number of examples per class
-    default_k_shot: 5  # Reduced from 10
-    query_set_size: 50  # Reduced from 100
+    default_k_shot: 16  # Reduced from 10
+    query_set_size: 32  # Reduced from 100
     num_tasks_train: 100  # Reduced from 1000
     num_tasks_val: 20   # Reduced from 200
     num_tasks_test: 20  # Reduced from 200
