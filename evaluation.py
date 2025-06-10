@@ -443,6 +443,21 @@ class Evaluator:
                     
         return original_params
     
+    def _convert_to_serializable(self, obj):
+        """Convert numpy types to Python native types for JSON serialization."""
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {key: self._convert_to_serializable(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_to_serializable(item) for item in obj]
+        else:
+            return obj
+
     def save_results(self, filepath: str, format: str = 'json'):
         """Save evaluation results."""
         results_data = {
@@ -453,8 +468,10 @@ class Evaluator:
         }
         
         if format == 'json':
+            # Convert numpy types to serializable types
+            serializable_data = self._convert_to_serializable(results_data)
             with open(filepath, 'w') as f:
-                json.dump(results_data, f, indent=2)
+                json.dump(serializable_data, f, indent=2)
         elif format == 'csv':
             # Save aggregate metrics as CSV
             df = pd.DataFrame([results_data['aggregate_metrics']])
