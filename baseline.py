@@ -123,6 +123,9 @@ class FullMAML(BaselineMethod):
         total_loss = 0.0
         
         for support_set, query_set in task_batch:
+            # Set the number of classes for this task
+            num_classes = self._get_num_classes_from_data(support_set + query_set)
+            self.model.set_num_classes(num_classes)
             # Get initial LoRA parameters
             lora_params = self.model.get_lora_parameters()
             fast_weights = [p.clone() for p in lora_params]
@@ -178,6 +181,24 @@ class FullMAML(BaselineMethod):
         self.meta_optimizer.step()
         
         return total_loss.item()
+    
+    def _get_num_classes_from_data(self, data: List[Dict]) -> int:
+        """Extract number of classes from task data."""
+        if not data:
+            return self.model.max_num_labels  # Default fallback
+        
+        labels = [example['label'] for example in data]
+        unique_labels = set(labels)
+        num_classes = len(unique_labels)
+        
+        # Validate labels are in expected range
+        min_label, max_label = min(unique_labels), max(unique_labels)
+        if min_label < 0 or max_label >= num_classes:
+            self.logger.warning(f"Labels not in expected range [0, {num_classes-1}]: found range [{min_label}, {max_label}]")
+            # Assume labels are 0-indexed and max_label + 1 is the number of classes
+            num_classes = max_label + 1
+        
+        return num_classes
     
     def _create_param_dict(self, fast_weights: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Create parameter dictionary from flat weight list."""
@@ -342,6 +363,10 @@ class FOMAML(BaselineMethod):
         original_params = [p.clone() for p in self.model.get_lora_parameters()]
         
         for support_set, query_set in task_batch:
+            # Set the number of classes for this task
+            num_classes = self._get_num_classes_from_data(support_set + query_set)
+            self.model.set_num_classes(num_classes)
+            
             # Reset to original parameters for each task
             for p, orig_p in zip(self.model.get_lora_parameters(), original_params):
                 p.data = orig_p.data.clone()
@@ -407,6 +432,24 @@ class FOMAML(BaselineMethod):
         
         return total_loss / len(task_batch)
     
+    def _get_num_classes_from_data(self, data: List[Dict]) -> int:
+        """Extract number of classes from task data."""
+        if not data:
+            return self.model.max_num_labels  # Default fallback
+        
+        labels = [example['label'] for example in data]
+        unique_labels = set(labels)
+        num_classes = len(unique_labels)
+        
+        # Validate labels are in expected range
+        min_label, max_label = min(unique_labels), max(unique_labels)
+        if min_label < 0 or max_label >= num_classes:
+            self.logger.warning(f"Labels not in expected range [0, {num_classes-1}]: found range [{min_label}, {max_label}]")
+            # Assume labels are 0-indexed and max_label + 1 is the number of classes
+            num_classes = max_label + 1
+        
+        return num_classes
+    
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
         """Evaluate on test tasks."""
         return self._evaluate_common(test_tasks)
@@ -448,7 +491,11 @@ class Reptile(BaselineMethod):
         for iteration in pbar:
             # Sample task
             task_idx = np.random.choice(len(meta_train_tasks))
-            support_set, _ = meta_train_tasks[task_idx]
+            support_set, query_set = meta_train_tasks[task_idx]
+            
+            # Set the number of classes for this task
+            num_classes = self._get_num_classes_from_data(support_set + query_set)
+            self.model.set_num_classes(num_classes)
             
             # Store initial parameters
             initial_params = [p.clone() for p in self.model.get_lora_parameters()]
@@ -492,6 +539,24 @@ class Reptile(BaselineMethod):
             if meta_val_tasks and iteration % 100 == 0:
                 val_metrics = self.evaluate(meta_val_tasks[:50])  # Subset for speed
                 self.logger.info(f"Validation: {val_metrics}")
+                
+    def _get_num_classes_from_data(self, data: List[Dict]) -> int:
+        """Extract number of classes from task data."""
+        if not data:
+            return self.model.max_num_labels  # Default fallback
+        
+        labels = [example['label'] for example in data]
+        unique_labels = set(labels)
+        num_classes = len(unique_labels)
+        
+        # Validate labels are in expected range
+        min_label, max_label = min(unique_labels), max(unique_labels)
+        if min_label < 0 or max_label >= num_classes:
+            self.logger.warning(f"Labels not in expected range [0, {num_classes-1}]: found range [{min_label}, {max_label}]")
+            # Assume labels are 0-indexed and max_label + 1 is the number of classes
+            num_classes = max_label + 1
+        
+        return num_classes
                 
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
         """Evaluate on test tasks using the unified evaluation protocol."""
