@@ -179,7 +179,9 @@ class FullMAML(BaselineMethod):
             return query_outputs['loss']
 
         in_dims = (None, None, 0, 0)
-        query_losses = func.vmap(full_maml_single_task_loss, in_dims=in_dims)(
+        query_losses = func.vmap(
+            full_maml_single_task_loss, in_dims=in_dims, randomness='different'
+        )(
             params, buffers, collated_support, collated_query
         )
 
@@ -377,7 +379,9 @@ class FOMAML(BaselineMethod):
         # Vectorize the single-task function over the meta-batch dimension (dim 0)
         # We broadcast the params and buffers to each task (in_dims=None)
         in_dims = (None, None, 0, 0)
-        query_losses = func.vmap(fomaml_single_task_loss, in_dims=in_dims)(
+        query_losses = func.vmap(
+            fomaml_single_task_loss, in_dims=in_dims, randomness='different'
+        )(
             params, buffers, collated_support, collated_query
         )
 
@@ -465,7 +469,9 @@ class Reptile(BaselineMethod):
 
         in_dims = (None, None, 0)
         # vmap returns adapted_params for each task, stacked along dim 0
-        avg_losses, adapted_params_batch = func.vmap(reptile_single_task_adapt, in_dims=in_dims)(
+        avg_losses, adapted_params_batch = func.vmap(
+            reptile_single_task_adapt, in_dims=in_dims, randomness='different'
+        )(
             params, buffers, collated_support
         )
         

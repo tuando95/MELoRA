@@ -197,7 +197,9 @@ class MELoRATrainer:
 
         # Vectorize over the meta-batch dimension
         in_dims = (None, None, 0, 0)
-        query_losses, lora_reg_losses = func.vmap(melora_single_task_loss, in_dims=in_dims)(
+        query_losses, lora_reg_losses = func.vmap(
+            melora_single_task_loss, in_dims=in_dims, randomness='different'
+        )(
             params, buffers, collated_support, collated_query
         )
 
