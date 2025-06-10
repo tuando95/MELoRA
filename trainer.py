@@ -164,7 +164,8 @@ class MELoRATrainer:
         self.meta_optimizer.zero_grad()
 
         collated_support, collated_query = self._get_task_tensors(task_batch)
-        params = {name: p for name, p in self.model.named_parameters() if p.requires_grad}
+        # Ensure parameters have requires_grad=True and are detached for vmap
+        params = {name: p.detach().requires_grad_(True) for name, p in self.model.named_parameters() if p.requires_grad}
         buffers = {name: b for name, b in self.model.named_buffers()}
 
         # Capture necessary values from `self` into local variables.
@@ -197,11 +198,19 @@ class MELoRATrainer:
                     reg_loss = _lora_regularization_static(lora_params)
                     inner_loss += lora_config_local['regularization_weight'] * reg_loss
 
-                grads = torch.autograd.grad(inner_loss, list(fast_params.values()), allow_unused=True)
-                fast_params = {
-                    name: p - inner_lr_local * g if g is not None else p
-                    for (name, p), g in zip(fast_params.items(), grads)
-                }
+                # Only compute gradients for parameters that require grad
+                grad_params = [p for p in fast_params.values() if p.requires_grad]
+                grad_param_names = [name for name, p in fast_params.items() if p.requires_grad]
+                
+                if grad_params:  # Only compute gradients if there are parameters that require grad
+                    grads = torch.autograd.grad(inner_loss, grad_params, create_graph=True, allow_unused=True)
+                    
+                    # Update fast_params with gradients
+                    grad_dict = dict(zip(grad_param_names, grads))
+                    fast_params = {
+                        name: p - inner_lr_local * grad_dict.get(name, torch.zeros_like(p)) if p.requires_grad else p
+                        for name, p in fast_params.items()
+                    }
             
             # Evaluate on query set
             query_batch_device = utils.move_to_device(query_batch, device_local)
@@ -510,4 +519,21 @@ class MELoRATrainer:
         )
         
         self.global_step = checkpoint.get('epoch', 0)
-        self.logger.info(f"Loaded checkpoint from iteration {self.global_step}") 
+        self.logger.info(f"Loaded checkpoint from iteration {self.global_step}")
+    
+    def _log_metrics(self, iteration: int, meta_loss: float, query_loss: float, lora_reg_loss: float):
+        """Log training metrics."""
+        self.logger.info(f"Iteration {iteration}: Meta Loss = {meta_loss:.4f}, "
+                        f"Query Loss = {query_loss:.4f}, LoRA Reg Loss = {lora_reg_loss:.4f}")
+    
+    def _run_validation(self, meta_val_tasks: List, iteration: int):
+        """Run validation and log results."""
+        val_metrics = self.validate(meta_val_tasks)
+        self.logger.info(f"Iteration {iteration} Validation: "
+                        f"Loss = {val_metrics['meta_val_loss']:.4f}, "
+                        f"Accuracy = {val_metrics['meta_val_accuracy']:.4f}")
+        
+        # Update best validation loss
+        if val_metrics['meta_val_loss'] < self.best_val_loss:
+            self.best_val_loss = val_metrics['meta_val_loss']
+            self.logger.info(f"New best validation loss: {self.best_val_loss:.4f}") 
