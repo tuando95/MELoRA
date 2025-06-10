@@ -256,8 +256,30 @@ class MELoRATrainer:
         
         return total_query_loss / len(task_batch)
     
+    def _get_num_classes_from_data(self, data: List[Dict]) -> int:
+        """Extract number of classes from task data."""
+        if not data:
+            return self.model.max_num_labels  # Default fallback
+        
+        labels = [example['label'] for example in data]
+        unique_labels = set(labels)
+        num_classes = len(unique_labels)
+        
+        # Validate labels are in expected range
+        min_label, max_label = min(unique_labels), max(unique_labels)
+        if min_label < 0 or max_label >= num_classes:
+            self.logger.warning(f"Labels not in expected range [0, {num_classes-1}]: found range [{min_label}, {max_label}]")
+            # Assume labels are 0-indexed and max_label + 1 is the number of classes
+            num_classes = max_label + 1
+        
+        return num_classes
+    
     def _inner_loop_adaptation(self, support_set: List[Dict]) -> List[torch.Tensor]:
         """Perform inner loop adaptation on support set."""
+        # Set the number of classes for this task
+        num_classes = self._get_num_classes_from_data(support_set)
+        self.model.set_num_classes(num_classes)
+        
         # Create a copy of current parameters with gradient tracking
         adapted_params = []
         for p in self.model.get_lora_parameters():
@@ -312,6 +334,10 @@ class MELoRATrainer:
                            query_set: List[Dict],
                            adapted_params: List[torch.Tensor]) -> torch.Tensor:
         """Compute loss on query set with adapted parameters."""
+        # Set the number of classes for this task
+        num_classes = self._get_num_classes_from_data(query_set)
+        self.model.set_num_classes(num_classes)
+        
         # Create data loader for query set
         query_loader = self.dataset_loader.get_data_loader(
             query_set,
@@ -440,6 +466,10 @@ class MELoRATrainer:
             for support_set, query_set in tqdm(val_tasks, desc="Validation"):
                 # Inner loop adaptation
                 adapted_params = self._inner_loop_adaptation(support_set)
+                
+                # Set the number of classes for the query evaluation
+                num_classes = self._get_num_classes_from_data(query_set)
+                self.model.set_num_classes(num_classes)
                 
                 # Evaluate on query set
                 query_loader = self.dataset_loader.get_data_loader(

@@ -104,7 +104,7 @@ meta_learning:
     
   # Batch configuration
   meta_batch_sizes: [4, 8, 16]  # Number of tasks per meta-update
-  default_meta_batch_size: 4  # Reduced from 8 for speed
+  default_meta_batch_size: 8  # Reduced from 8 for speed
   
   # Training iterations
   num_meta_iterations: 100  # Reduced from 10000 for testing
@@ -117,7 +117,7 @@ memory_optimization:
   gradient_accumulation:
     enabled: true
     micro_batch_sizes: [2, 4, 8]  # Micro-batch for memory reduction
-    default_micro_batch: 2  # Reduced from 4
+    default_micro_batch: 4  # Reduced from 4
   
   # Selective Checkpointing
   checkpointing:
@@ -135,7 +135,7 @@ memory_optimization:
   
   # Memory Management
   memory_limits:
-    max_gpu_memory_mb: 8192  # 8GB limit for consumer GPUs
+    max_gpu_memory_mb: 16384  # 8GB limit for consumer GPUs
     reserve_memory_mb: 512  # Reserved for system
     enable_cpu_offload: false
     gradient_checkpointing: true
@@ -225,7 +225,7 @@ datasets:
 
 # Synthetic Data Generation
 synthetic_data:
-  enabled: true  # Enable for faster loading
+  enabled: false  # Enable for faster loading
   
   # Task generation parameters
   task_generation:
@@ -329,7 +329,7 @@ evaluation:
 baselines:
   methods:
     - name: "full_maml"
-      enabled: false  # May not fit in memory
+      enabled: true  # May not fit in memory
       config:
         inner_lr: 0.01
         outer_lr: 0.001
@@ -372,7 +372,7 @@ hardware:
   # GPU Settings
   gpu:
     device_ids: [0]  # List of GPU IDs to use
-    primary_gpu: "NVIDIA RTX 3080"
+    primary_gpu: "NVIDIA L40s"
     memory_gb: 10
     allow_growth: true
     per_process_memory_fraction: 0.9

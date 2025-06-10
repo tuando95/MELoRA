@@ -254,8 +254,9 @@ class MELoRAModel(nn.Module):
         """Initialize task-specific head."""
         # For now, assume classification tasks
         # This can be extended for other task types
-        self.num_labels = 3  # Max for MNLI, CB
-        self.classifier = nn.Linear(self.hidden_size, self.num_labels)
+        self.max_num_labels = 3  # Max for MNLI, CB
+        self.classifier = nn.Linear(self.hidden_size, self.max_num_labels)
+        self.current_num_labels = self.max_num_labels  # Track current task's class count
         
     def forward(self, 
                 input_ids: torch.Tensor,
@@ -292,6 +293,10 @@ class MELoRAModel(nn.Module):
         # Apply classifier
         logits = self.classifier(pooled_output)
         
+        # Only use logits for current task's number of classes
+        if self.current_num_labels < self.max_num_labels:
+            logits = logits[:, :self.current_num_labels]
+        
         # Compute loss if labels provided
         loss = None
         if labels is not None:
@@ -303,6 +308,13 @@ class MELoRAModel(nn.Module):
             'hidden_states': hidden_states
         }
         
+    def set_num_classes(self, num_classes: int):
+        """Set the number of classes for the current task."""
+        if num_classes > self.max_num_labels:
+            raise ValueError(f"Number of classes {num_classes} exceeds maximum {self.max_num_labels}")
+        self.current_num_labels = num_classes
+        self.logger.debug(f"Set current task to {num_classes} classes")
+
     def get_lora_parameters(self) -> List[nn.Parameter]:
         """Get only LoRA parameters for optimization."""
         params = []
