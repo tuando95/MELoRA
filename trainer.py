@@ -84,8 +84,31 @@ class MELoRATrainer:
             
         # Inner loop optimizer is created per task
         
+    def _pad_and_collate(self, tensor_list: List[Dict], max_size: int) -> Dict[str, torch.Tensor]:
+        """Pads tensors in a list to a max size and stacks them."""
+        padded_tensors = []
+        pad_token_id = self.dataset_loader.tokenizer.pad_token_id
+        for tensors in tensor_list:
+            padded_dict = {}
+            current_size = tensors['input_ids'].shape[0]
+            pad_size = max_size - current_size
+
+            if pad_size > 0:
+                padded_dict['input_ids'] = F.pad(
+                    tensors['input_ids'], (0, 0, 0, pad_size), value=pad_token_id)
+                padded_dict['attention_mask'] = F.pad(
+                    tensors['attention_mask'], (0, 0, 0, pad_size), value=0)
+                padded_dict['labels'] = F.pad(
+                    tensors['labels'], (0, pad_size), value=-100)
+            else:
+                padded_dict = tensors
+            
+            padded_tensors.append(padded_dict)
+
+        return {k: torch.stack([s[k] for s in padded_tensors]) for k in padded_tensors[0]}
+
     def _get_task_tensors(self, task_list):
-        """Collates a list of tasks into batched tensors for vmap."""
+        """Collates and pads tasks into batched tensors for vmap."""
         support_tensors, query_tensors = [], []
         for support_set, query_set in task_list:
             support_loader = self.dataset_loader.get_data_loader(
@@ -95,8 +118,12 @@ class MELoRATrainer:
             support_tensors.append(next(iter(support_loader)))
             query_tensors.append(next(iter(query_loader)))
 
-        collated_support = {k: torch.stack([s[k] for s in support_tensors]) for k in support_tensors[0]}
-        collated_query = {k: torch.stack([q[k] for q in query_tensors]) for k in query_tensors[0]}
+        max_support_size = max(s['input_ids'].shape[0] for s in support_tensors)
+        max_query_size = max(q['input_ids'].shape[0] for q in query_tensors)
+
+        collated_support = self._pad_and_collate(support_tensors, max_support_size)
+        collated_query = self._pad_and_collate(query_tensors, max_query_size)
+        
         return collated_support, collated_query
 
     def train(self, meta_train_tasks: List, meta_val_tasks: Optional[List] = None, num_iterations: Optional[int] = None):

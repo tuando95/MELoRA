@@ -62,6 +62,60 @@ class BaselineMethod(ABC):
         """Load model checkpoint."""
         return self.model.load_checkpoint(filepath)
 
+    def _pad_and_collate(self, tensor_list: List[Dict], max_size: int) -> Dict[str, torch.Tensor]:
+        """Pads tensors in a list to a max size and stacks them."""
+        padded_tensors = []
+        # Use a default pad_token_id if tokenizer is not directly on dataset_loader
+        pad_token_id = getattr(self.dataset_loader.tokenizer, 'pad_token_id', 0)
+        
+        for tensors in tensor_list:
+            padded_dict = {}
+            current_size = tensors['input_ids'].shape[0]
+            pad_size = max_size - current_size
+
+            if pad_size > 0:
+                padded_dict['input_ids'] = F.pad(
+                    tensors['input_ids'], (0, 0, 0, pad_size), value=pad_token_id)
+                padded_dict['attention_mask'] = F.pad(
+                    tensors['attention_mask'], (0, 0, 0, pad_size), value=0)
+                padded_dict['labels'] = F.pad(
+                    tensors['labels'], (0, pad_size), value=-100)
+            else:
+                padded_dict = tensors
+            
+            padded_tensors.append(padded_dict)
+
+        return {k: torch.stack([s[k] for s in padded_tensors]) for k in padded_tensors[0]}
+
+    def _get_task_tensors(self, task_list):
+        """Collates and pads tasks into batched tensors for vmap."""
+        support_tensors, query_tensors = [], []
+        
+        has_query = task_list and len(task_list[0]) > 1 and task_list[0][1] is not None
+        
+        for item in task_list:
+            support_set = item[0]
+            query_set = item[1] if has_query else None
+
+            support_loader = self.dataset_loader.get_data_loader(
+                support_set, batch_size=len(support_set), shuffle=False)
+            support_tensors.append(next(iter(support_loader)))
+
+            if query_set:
+                query_loader = self.dataset_loader.get_data_loader(
+                    query_set, batch_size=len(query_set), shuffle=False)
+                query_tensors.append(next(iter(query_loader)))
+
+        max_support_size = max(s['input_ids'].shape[0] for s in support_tensors)
+        collated_support = self._pad_and_collate(support_tensors, max_support_size)
+
+        collated_query = None
+        if query_tensors:
+            max_query_size = max(q['input_ids'].shape[0] for q in query_tensors)
+            collated_query = self._pad_and_collate(query_tensors, max_query_size)
+        
+        return collated_support, collated_query
+
 
 class FullMAML(BaselineMethod):
     """Full second-order MAML baseline (memory-intensive)."""
@@ -257,37 +311,6 @@ class FOMAML(BaselineMethod):
             lr=self.outer_lr
         )
         
-    def _functional_forward(self, params, buffers, batch):
-        """
-        A true functional forward pass using functional_call.
-        This version is vmap-compatible.
-        """
-        return func.functional_call(self.model, (params, buffers), (batch,))
-
-    def _get_task_tensors(self, task_list):
-        """Collates a list of tasks into batched tensors for vmap."""
-        support_tensors = []
-        query_tensors = []
-
-        for support_set, query_set in task_list:
-            # Use the existing loader to process one task at a time
-            support_loader = self.dataset_loader.get_data_loader(
-                support_set, batch_size=len(support_set), shuffle=False)
-            query_loader = self.dataset_loader.get_data_loader(
-                query_set, batch_size=len(query_set), shuffle=False)
-
-            support_batch = next(iter(support_loader))
-            query_batch = next(iter(query_loader))
-            
-            support_tensors.append(support_batch)
-            query_tensors.append(query_batch)
-
-        # Stack the tensors from each task along a new 'meta' dimension
-        collated_support = {k: torch.stack([s[k] for s in support_tensors]) for k in support_tensors[0]}
-        collated_query = {k: torch.stack([q[k] for q in query_tensors]) for k in query_tensors[0]}
-
-        return collated_support, collated_query
-
     def train(self, meta_train_tasks: List[Tuple[List, List]], 
              meta_val_tasks: Optional[List[Tuple[List, List]]] = None):
         """Train with FOMAML using a parallelized vmap approach."""
