@@ -159,22 +159,17 @@ class MELoRAModel(nn.Module):
         pretrained_name = model_info['pretrained']
         model_type = model_info['type']
         
-        # Load appropriate model based on type, forcing the "eager" attention
-        # implementation to avoid data-dependent control flow, which breaks vmap.
-        # The "eager" implementation is universally compatible.
+        # Load appropriate model based on type
         if model_type == 'gpt2':
-            self.base_model = GPT2Model.from_pretrained(
-                pretrained_name, attn_implementation="eager")
+            self.base_model = GPT2Model.from_pretrained(pretrained_name)
             self.model_type = 'gpt2'
             self.hidden_size = self.base_model.config.hidden_size
         elif model_type == 't5':
-            self.base_model = T5Model.from_pretrained(
-                pretrained_name, attn_implementation="eager")
+            self.base_model = T5Model.from_pretrained(pretrained_name)
             self.model_type = 't5'
             self.hidden_size = self.base_model.config.d_model
         elif model_type == 'bert':
-            self.base_model = DistilBertModel.from_pretrained(
-                pretrained_name, attn_implementation="eager")
+            self.base_model = DistilBertModel.from_pretrained(pretrained_name)
             self.model_type = 'bert'
             self.hidden_size = self.base_model.config.hidden_size
         else:

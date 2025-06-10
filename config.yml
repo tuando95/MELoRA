@@ -72,7 +72,6 @@ lora:
   default_rank: 8
   alpha: null  # If null, alpha = rank (following Hu et al., 2021)
   dropout: 0.1
-  regularization_weight: 0.01  # L2 regularization weight for LoRA parameters
   target_modules:  # Modules to apply LoRA
     gpt2: ["attn.c_attn", "attn.c_proj", "mlp.c_fc", "mlp.c_proj"]
     t5: ["q", "k", "v", "o"]
@@ -105,10 +104,10 @@ meta_learning:
     
   # Batch configuration
   meta_batch_sizes: [4, 8, 16]  # Number of tasks per meta-update
-  default_meta_batch_size: 8  # Reduced from 16 to prevent OOM
+  default_meta_batch_size: 16  # Reduced from 8 for speed
   
   # Training iterations
-  num_meta_iterations: 100  # Reduced from 10000 for testing
+  num_meta_iterations: 200  # Reduced from 10000 for testing
   validation_frequency: 20  # Validate more frequently
   checkpoint_frequency: 50  # Checkpoint more frequently
 
@@ -216,11 +215,11 @@ datasets:
   # Few-shot configuration
   few_shot:
     k_shot_options: [5, 10, 20]  # Number of examples per class
-    default_k_shot: 8  # Reduced from 16
-    query_set_size: 16  # Reduced from 32
-    num_tasks_train: 100  # Reduced from 1000
-    num_tasks_val: 20   # Reduced from 200
-    num_tasks_test: 20  # Reduced from 200
+    default_k_shot: 10 # Reduced from 10
+    query_set_size: 100  # Reduced from 100
+    num_tasks_train: 200  # Reduced from 1000
+    num_tasks_val: 40   # Reduced from 200
+    num_tasks_test: 40  # Reduced from 200
     stratified_sampling: true
     seed: 42
 
@@ -364,7 +363,7 @@ baselines:
         epochs: 10
     
     - name: "prototypical_networks"
-      enabled: true
+      enabled: false
       config:
         embedding_dim: 128
 
@@ -374,7 +373,7 @@ hardware:
   gpu:
     device_ids: [0]  # List of GPU IDs to use
     primary_gpu: "NVIDIA L40s"
-    memory_gb: 10
+    memory_gb: 48
     allow_growth: true
     per_process_memory_fraction: 0.9
   
