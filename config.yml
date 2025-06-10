@@ -72,6 +72,7 @@ lora:
   default_rank: 8
   alpha: null  # If null, alpha = rank (following Hu et al., 2021)
   dropout: 0.1
+  regularization_weight: 0.01  # L2 regularization weight for LoRA parameters
   target_modules:  # Modules to apply LoRA
     gpt2: ["attn.c_attn", "attn.c_proj", "mlp.c_fc", "mlp.c_proj"]
     t5: ["q", "k", "v", "o"]

@@ -39,6 +39,9 @@ class MELoRATrainer:
         # Move model to device
         self.model.to(self.device)
         
+        # LoRA Configuration
+        self.lora_config = config['lora']
+        
         # Meta-learning configuration
         self.meta_config = config['meta_learning']
         self.inner_lr = self.meta_config['inner']['default_lr']
