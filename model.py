@@ -330,14 +330,22 @@ class MELoRAModel(nn.Module):
         """Compute Hessian-vector product for second-order optimization."""
         # First compute gradient
         grads = torch.autograd.grad(loss, self.get_lora_parameters(), 
-                                   create_graph=True, retain_graph=True)
+                                   create_graph=True, retain_graph=True, allow_unused=True)
+        
+        # Handle None gradients
+        grads = [g if g is not None else torch.zeros_like(p) 
+                for g, p in zip(grads, self.get_lora_parameters())]
         
         # Flatten gradients
         flat_grads = torch.cat([g.view(-1) for g in grads])
         
         # Compute HVP
         hvp = torch.autograd.grad(flat_grads, self.get_lora_parameters(),
-                                 grad_outputs=vector, retain_graph=True)
+                                 grad_outputs=vector, retain_graph=True, allow_unused=True)
+        
+        # Handle None gradients
+        hvp = [h if h is not None else torch.zeros_like(p) 
+              for h, p in zip(hvp, self.get_lora_parameters())]
         
         return torch.cat([h.view(-1) for h in hvp])
     

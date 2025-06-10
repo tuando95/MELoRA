@@ -142,11 +142,33 @@ class Evaluator:
             
         return query_metrics
     
+    def _get_num_classes_from_data(self, data: List[Dict]) -> int:
+        """Extract number of classes from task data."""
+        if not data:
+            return 3  # Default fallback
+        
+        labels = [example['label'] for example in data]
+        unique_labels = set(labels)
+        num_classes = len(unique_labels)
+        
+        # Validate labels are in expected range
+        min_label, max_label = min(unique_labels), max(unique_labels)
+        if min_label < 0 or max_label >= num_classes:
+            # Assume labels are 0-indexed and max_label + 1 is the number of classes
+            num_classes = max_label + 1
+        
+        return num_classes
+
     def _adapt_to_task(self,
                       support_set: List[Dict],
                       adaptation_steps: int,
                       adaptation_lr: float) -> List[torch.Tensor]:
         """Adapt model parameters to a specific task."""
+        # Set the number of classes for this task
+        if hasattr(self.model, 'set_num_classes'):
+            num_classes = self._get_num_classes_from_data(support_set)
+            self.model.set_num_classes(num_classes)
+            
         # Get LoRA parameters
         if hasattr(self.model, 'get_lora_parameters'):
             adapted_params = [p.clone() for p in self.model.get_lora_parameters()]
@@ -172,8 +194,12 @@ class Evaluator:
                 
                 # Compute gradients
                 grads = torch.autograd.grad(
-                    loss, adapted_params, create_graph=False
+                    loss, adapted_params, create_graph=False, allow_unused=True
                 )
+                
+                # Handle None gradients for unused parameters
+                grads = [g if g is not None else torch.zeros_like(p) 
+                        for g, p in zip(grads, adapted_params)]
                 
                 # Restore original parameters
                 self._replace_parameters(original_params)
@@ -190,6 +216,11 @@ class Evaluator:
                              adapted_params: List[torch.Tensor],
                              task_idx: int) -> Dict[str, Any]:
         """Evaluate adapted model on query set."""
+        # Set the number of classes for this task
+        if hasattr(self.model, 'set_num_classes'):
+            num_classes = self._get_num_classes_from_data(query_set)
+            self.model.set_num_classes(num_classes)
+            
         query_loader = self.dataset_loader.get_data_loader(
             query_set, batch_size=len(query_set), shuffle=False
         )

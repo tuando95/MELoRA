@@ -124,7 +124,11 @@ class FullMAML(BaselineMethod):
                     loss = outputs['loss']
                     
                     # Compute gradients
-                    grads = torch.autograd.grad(loss, fast_weights, create_graph=True)
+                    grads = torch.autograd.grad(loss, fast_weights, create_graph=True, allow_unused=True)
+                    
+                    # Handle None gradients for unused parameters
+                    grads = [g if g is not None else torch.zeros_like(w) 
+                            for g, w in zip(grads, fast_weights)]
                     
                     # Update fast weights
                     fast_weights = [w - self.inner_lr * g 
