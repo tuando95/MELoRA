@@ -163,19 +163,25 @@ class FullMAML(BaselineMethod):
         params = {name: p for name, p in self.model.named_parameters()}
         buffers = {name: b for name, b in self.model.named_buffers()}
 
+        # Capture locals for vmap closure
+        inner_lr_local = self.inner_lr
+        inner_steps_local = self.inner_steps
+        device_local = self.device
+        model_local = self.model
+
         def full_maml_single_task_loss(params, buffers, support_batch, query_batch):
             fast_params = params
-            for _ in range(self.inner_steps):
-                support_batch_device = utils.move_to_device(support_batch, self.device)
-                support_outputs = func.functional_call(self.model, (fast_params, buffers), args=(), kwargs=support_batch_device)
+            for _ in range(inner_steps_local):
+                support_batch_device = utils.move_to_device(support_batch, device_local)
+                support_outputs = func.functional_call(model_local, (fast_params, buffers), args=(), kwargs=support_batch_device)
                 grads = torch.autograd.grad(support_outputs['loss'], list(fast_params.values()), create_graph=True, allow_unused=True)
                 fast_params = {
-                    name: p - self.inner_lr * g if g is not None else p
+                    name: p - inner_lr_local * g if g is not None else p
                     for (name, p), g in zip(fast_params.items(), grads)
                 }
             
-            query_batch_device = utils.move_to_device(query_batch, self.device)
-            query_outputs = func.functional_call(self.model, (fast_params, buffers), args=(), kwargs=query_batch_device)
+            query_batch_device = utils.move_to_device(query_batch, device_local)
+            query_outputs = func.functional_call(model_local, (fast_params, buffers), args=(), kwargs=query_batch_device)
             return query_outputs['loss']
 
         in_dims = (None, None, 0, 0)
@@ -350,30 +356,26 @@ class FOMAML(BaselineMethod):
         params = {name: p for name, p in self.model.named_parameters()}
         buffers = {name: b for name, b in self.model.named_buffers()}
 
-        # Define the function that processes a single task
+        # Capture locals for vmap closure
+        inner_lr_local = self.inner_lr
+        inner_steps_local = self.inner_steps
+        device_local = self.device
+        model_local = self.model
+
         def fomaml_single_task_loss(params, buffers, support_batch, query_batch):
-            # Inner loop adaptation
             fast_params = params
-            for _ in range(self.inner_steps):
-                # Ensure all tensors in the batch are on the correct device
-                support_batch_device = utils.move_to_device(support_batch, self.device)
-                
-                # Compute loss on support set
-                support_outputs = func.functional_call(self.model, (fast_params, buffers), args=(), kwargs=support_batch_device)
+            for _ in range(inner_steps_local):
+                support_batch_device = utils.move_to_device(support_batch, device_local)
+                support_outputs = func.functional_call(model_local, (fast_params, buffers), args=(), kwargs=support_batch_device)
                 support_loss = support_outputs['loss']
-                
-                # Compute gradients for the inner loop
                 grads = torch.autograd.grad(support_loss, fast_params.values(), allow_unused=True)
-                
-                # Update parameters
                 fast_params = {
-                    name: p - self.inner_lr * g if g is not None else p
+                    name: p - inner_lr_local * g if g is not None else p
                     for (name, p), g in zip(fast_params.items(), grads)
                 }
 
-            # Evaluate on the query set with the adapted parameters
-            query_batch_device = utils.move_to_device(query_batch, self.device)
-            query_outputs = func.functional_call(self.model, (fast_params, buffers), args=(), kwargs=query_batch_device)
+            query_batch_device = utils.move_to_device(query_batch, device_local)
+            query_outputs = func.functional_call(model_local, (fast_params, buffers), args=(), kwargs=query_batch_device)
             return query_outputs['loss']
 
         # Vectorize the single-task function over the meta-batch dimension (dim 0)
@@ -450,22 +452,26 @@ class Reptile(BaselineMethod):
         params = {name: p for name, p in self.model.named_parameters()}
         buffers = {name: b for name, b in self.model.named_buffers()}
 
+        # Capture locals for vmap closure
+        lr_local = self.lr
+        inner_steps_local = self.inner_steps
+        device_local = self.device
+        model_local = self.model
+
         def reptile_single_task_adapt(params, buffers, support_batch):
             fast_params = params
             total_loss = 0.0
-            for _ in range(self.inner_steps):
-                support_batch_device = utils.move_to_device(support_batch, self.device)
-                support_outputs = func.functional_call(self.model, (fast_params, buffers), args=(), kwargs=support_batch_device)
+            for _ in range(inner_steps_local):
+                support_batch_device = utils.move_to_device(support_batch, device_local)
+                support_outputs = func.functional_call(model_local, (fast_params, buffers), args=(), kwargs=support_batch_device)
                 loss = support_outputs['loss']
                 grads = torch.autograd.grad(loss, list(fast_params.values()), allow_unused=True)
                 fast_params = {
-                    name: p - self.lr * g if g is not None else p
+                    name: p - lr_local * g if g is not None else p
                     for (name, p), g in zip(fast_params.items(), grads)
                 }
                 total_loss += loss
-            # vmap requires that all returned tensors have a batch dimension.
-            # We return the total loss and the final parameters for this task.
-            return total_loss / self.inner_steps, fast_params
+            return total_loss / inner_steps_local, fast_params
 
         in_dims = (None, None, 0)
         # vmap returns adapted_params for each task, stacked along dim 0

@@ -164,34 +164,51 @@ class MELoRATrainer:
         params = {name: p for name, p in self.model.named_parameters() if p.requires_grad}
         buffers = {name: b for name, b in self.model.named_buffers()}
 
+        # Capture necessary values from `self` into local variables.
+        # This makes them available to the inner function via closure,
+        # which is the correct way to handle state with vmap.
+        lora_config_local = self.lora_config
+        inner_lr_local = self.inner_lr
+        inner_steps_local = self.inner_steps
+        device_local = self.device
+        model_local = self.model
+        grad_clip_norm_local = self.config['training']['grad_clip_norm']
+
         def melora_single_task_loss(params, buffers, support_batch, query_batch):
+            # This is a static helper function now, as it doesn't depend on `self`
+            def _lora_regularization_static(lora_params: List[torch.Tensor]) -> torch.Tensor:
+                reg_loss = torch.tensor(0.0, device=device_local)
+                for param in lora_params:
+                    reg_loss += torch.norm(param, p=2)
+                return reg_loss
+
             # Inner loop adaptation
             fast_params = params
-            for _ in range(self.inner_steps):
-                support_batch_device = utils.move_to_device(support_batch, self.device)
-                support_outputs = func.functional_call(self.model, (fast_params, buffers), args=(), kwargs=support_batch_device)
+            for _ in range(inner_steps_local):
+                support_batch_device = utils.move_to_device(support_batch, device_local)
+                support_outputs = func.functional_call(model_local, (fast_params, buffers), args=(), kwargs=support_batch_device)
                 
                 inner_loss = support_outputs['loss']
-                if self.lora_config['regularization_weight'] > 0:
+                if lora_config_local['regularization_weight'] > 0:
                     lora_params = [p for name, p in fast_params.items() if 'lora' in name]
-                    reg_loss = self._lora_regularization(lora_params)
-                    inner_loss += self.lora_config['regularization_weight'] * reg_loss
+                    reg_loss = _lora_regularization_static(lora_params)
+                    inner_loss += lora_config_local['regularization_weight'] * reg_loss
 
                 grads = torch.autograd.grad(inner_loss, list(fast_params.values()), allow_unused=True)
                 fast_params = {
-                    name: p - self.inner_lr * g if g is not None else p
+                    name: p - inner_lr_local * g if g is not None else p
                     for (name, p), g in zip(fast_params.items(), grads)
                 }
             
             # Evaluate on query set
-            query_batch_device = utils.move_to_device(query_batch, self.device)
-            query_outputs = func.functional_call(self.model, (fast_params, buffers), args=(), kwargs=query_batch_device)
+            query_batch_device = utils.move_to_device(query_batch, device_local)
+            query_outputs = func.functional_call(model_local, (fast_params, buffers), args=(), kwargs=query_batch_device)
             task_query_loss = query_outputs['loss']
 
-            task_lora_reg_loss = torch.tensor(0.0, device=self.device)
-            if self.lora_config['regularization_weight'] > 0:
+            task_lora_reg_loss = torch.tensor(0.0, device=device_local)
+            if lora_config_local['regularization_weight'] > 0:
                 lora_params = [p for name, p in fast_params.items() if 'lora' in name]
-                task_lora_reg_loss = self._lora_regularization(lora_params)
+                task_lora_reg_loss = _lora_regularization_static(lora_params)
             
             return task_query_loss, task_lora_reg_loss
 
@@ -206,10 +223,10 @@ class MELoRATrainer:
         # Aggregate losses and perform the meta-update
         query_loss = torch.mean(query_losses)
         lora_reg_loss = torch.mean(lora_reg_losses)
-        meta_loss = query_loss + self.lora_config['regularization_weight'] * lora_reg_loss
+        meta_loss = query_loss + lora_config_local['regularization_weight'] * lora_reg_loss
 
         meta_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['training']['grad_clip_norm'])
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip_norm_local)
         self.meta_optimizer.step()
 
         return meta_loss.item(), query_loss.item(), lora_reg_loss.item()
