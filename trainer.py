@@ -87,54 +87,16 @@ class MELoRATrainer:
             
         # Inner loop optimizer is created per task
         
-    def _pad_and_collate(self, tensor_list: List[Dict], max_size: int) -> Dict[str, torch.Tensor]:
-        """Pads tensors in a list to a max size and stacks them."""
-        padded_tensors = []
-        pad_token_id = self.dataset_loader.tokenizer.pad_token_id
-        for tensors in tensor_list:
-            padded_dict = {}
-            current_size = tensors['input_ids'].shape[0]
-            pad_size = max_size - current_size
 
-            if pad_size > 0:
-                padded_dict['input_ids'] = F.pad(
-                    tensors['input_ids'], (0, 0, 0, pad_size), value=pad_token_id)
-                padded_dict['attention_mask'] = F.pad(
-                    tensors['attention_mask'], (0, 0, 0, pad_size), value=0)
-                padded_dict['labels'] = F.pad(
-                    tensors['labels'], (0, pad_size), value=-100)
-            else:
-                padded_dict = tensors
-            
-            padded_tensors.append(padded_dict)
 
-        return {k: torch.stack([s[k] for s in padded_tensors]) for k in padded_tensors[0]}
 
-    def _get_task_tensors(self, task_list):
-        """Collates and pads tasks into batched tensors for vmap."""
-        support_tensors, query_tensors = [], []
-        for support_set, query_set in task_list:
-            support_loader = self.dataset_loader.get_data_loader(
-                support_set, batch_size=len(support_set), shuffle=False)
-            query_loader = self.dataset_loader.get_data_loader(
-                query_set, batch_size=len(query_set), shuffle=False)
-            support_tensors.append(next(iter(support_loader)))
-            query_tensors.append(next(iter(query_loader)))
-
-        max_support_size = max(s['input_ids'].shape[0] for s in support_tensors)
-        max_query_size = max(q['input_ids'].shape[0] for q in query_tensors)
-
-        collated_support = self._pad_and_collate(support_tensors, max_support_size)
-        collated_query = self._pad_and_collate(query_tensors, max_query_size)
-        
-        return collated_support, collated_query
 
     def train(self, meta_train_tasks: List, meta_val_tasks: Optional[List] = None, num_iterations: Optional[int] = None):
-        """Train the MELoRA model using a parallelized vmap approach."""
+        """Train the MELoRA model using meta-learning."""
         num_iterations = num_iterations or self.meta_config['num_meta_iterations']
         
-        self.logger.info("Starting Parallelized MELoRA training (vmap)")
-        pbar = tqdm(range(num_iterations), desc="MELoRA Training (vmap)")
+        self.logger.info("Starting MELoRA training")
+        pbar = tqdm(range(num_iterations), desc="MELoRA Training")
 
         for iteration in pbar:
             self.model.train()
@@ -160,88 +122,43 @@ class MELoRATrainer:
                 self.save_checkpoint(f"iter_{iteration}.pt")
     
     def _meta_train_step_parallel(self, task_batch: List) -> Tuple[float, float, float]:
-        """A single parallel meta-update step using vmap."""
+        """A single meta-update step using sequential processing (fallback from vmap)."""
         self.meta_optimizer.zero_grad()
 
-        collated_support, collated_query = self._get_task_tensors(task_batch)
-        # Ensure parameters have requires_grad=True and are detached for vmap
-        params = {name: p.detach().requires_grad_(True) for name, p in self.model.named_parameters() if p.requires_grad}
-        buffers = {name: b for name, b in self.model.named_buffers()}
-
-        # Capture necessary values from `self` into local variables.
-        # This makes them available to the inner function via closure,
-        # which is the correct way to handle state with vmap.
-        lora_config_local = self.lora_config
-        inner_lr_local = self.inner_lr
-        inner_steps_local = self.inner_steps
-        device_local = self.device
-        model_local = self.model
-        grad_clip_norm_local = self.config['training']['regularization']['gradient_clipping']
-
-        def melora_single_task_loss(params, buffers, support_batch, query_batch):
-            # This is a static helper function now, as it doesn't depend on `self`
-            def _lora_regularization_static(lora_params: List[torch.Tensor]) -> torch.Tensor:
-                reg_loss = torch.tensor(0.0, device=device_local)
-                for param in lora_params:
-                    reg_loss += torch.norm(param, p=2)
-                return reg_loss
-
-            # Inner loop adaptation
-            fast_params = params
-            for _ in range(inner_steps_local):
-                support_batch_device = utils.move_to_device(support_batch, device_local)
-                support_outputs = func.functional_call(model_local, (fast_params, buffers), args=(), kwargs=support_batch_device)
-                
-                inner_loss = support_outputs['loss']
-                if lora_config_local['regularization_weight'] > 0:
-                    lora_params = [p for name, p in fast_params.items() if 'lora' in name]
-                    reg_loss = _lora_regularization_static(lora_params)
-                    inner_loss += lora_config_local['regularization_weight'] * reg_loss
-
-                # Only compute gradients for parameters that require grad
-                grad_params = [p for p in fast_params.values() if p.requires_grad]
-                grad_param_names = [name for name, p in fast_params.items() if p.requires_grad]
-                
-                if grad_params:  # Only compute gradients if there are parameters that require grad
-                    grads = torch.autograd.grad(inner_loss, grad_params, create_graph=True, allow_unused=True)
-                    
-                    # Update fast_params with gradients
-                    grad_dict = dict(zip(grad_param_names, grads))
-                    fast_params = {
-                        name: p - inner_lr_local * grad_dict.get(name, torch.zeros_like(p)) if p.requires_grad else p
-                        for name, p in fast_params.items()
-                    }
+        total_query_loss = 0.0
+        total_lora_reg_loss = 0.0
+        
+        # Process each task in the batch sequentially
+        for support_set, query_set in task_batch:
+            # Perform inner loop adaptation
+            adapted_params = self._inner_loop_adaptation(support_set)
             
-            # Evaluate on query set
-            query_batch_device = utils.move_to_device(query_batch, device_local)
-            query_outputs = func.functional_call(model_local, (fast_params, buffers), args=(), kwargs=query_batch_device)
-            task_query_loss = query_outputs['loss']
-
-            task_lora_reg_loss = torch.tensor(0.0, device=device_local)
-            if lora_config_local['regularization_weight'] > 0:
-                lora_params = [p for name, p in fast_params.items() if 'lora' in name]
-                task_lora_reg_loss = _lora_regularization_static(lora_params)
+            # Compute query loss with adapted parameters
+            query_loss = self._compute_query_loss(query_set, adapted_params)
             
-            return task_query_loss, task_lora_reg_loss
+            # Compute LoRA regularization loss
+            lora_reg_loss = 0.0
+            if self.lora_config['regularization_weight'] > 0:
+                for param in self.model.get_lora_parameters():
+                    lora_reg_loss += torch.norm(param, p=2)
+                lora_reg_loss *= self.lora_config['regularization_weight']
+            
+            # Accumulate losses
+            total_query_loss += query_loss
+            total_lora_reg_loss += lora_reg_loss
 
-        # Vectorize over the meta-batch dimension
-        in_dims = (None, None, 0, 0)
-        query_losses, lora_reg_losses = func.vmap(
-            melora_single_task_loss, in_dims=in_dims, randomness='different'
-        )(
-            params, buffers, collated_support, collated_query
-        )
+        # Average losses over the meta-batch
+        avg_query_loss = total_query_loss / len(task_batch)
+        avg_lora_reg_loss = total_lora_reg_loss / len(task_batch)
+        meta_loss = avg_query_loss + avg_lora_reg_loss
 
-        # Aggregate losses and perform the meta-update
-        query_loss = torch.mean(query_losses)
-        lora_reg_loss = torch.mean(lora_reg_losses)
-        meta_loss = query_loss + lora_config_local['regularization_weight'] * lora_reg_loss
-
+        # Backward pass and optimization step
         meta_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip_norm_local)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 
+                                     self.config['training']['regularization']['gradient_clipping'])
         self.meta_optimizer.step()
 
-        return meta_loss.item(), query_loss.item(), lora_reg_loss.item()
+        return meta_loss.item(), avg_query_loss.item(), avg_lora_reg_loss.item()
     
     def _get_num_classes_from_data(self, data: List[Dict]) -> int:
         """Extract number of classes from task data."""
