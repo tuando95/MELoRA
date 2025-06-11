@@ -479,8 +479,7 @@ class FOMAML(BaselineMethod):
         self.model.train()
         self.meta_optimizer.zero_grad()
         
-        total_loss_for_logging = 0.0  # For logging only
-        accumulated_grads = []
+        total_loss = 0.0
         
         # Save original parameters once
         original_params = [p.clone() for p in self.model.get_lora_parameters()]
@@ -522,48 +521,26 @@ class FOMAML(BaselineMethod):
                 query_set, batch_size=len(query_set)
             )
             
-            task_query_loss = 0.0
             for batch in query_loader:
                 batch = utils.move_to_device(batch, self.device)
                 outputs = self.model(**batch)
                 query_loss = outputs['loss']
+                total_loss += query_loss
                 
-                # For logging: accumulate scalar loss values
-                task_query_loss += query_loss.item()
-                
-                # Compute gradients w.r.t. adapted parameters (individual gradients)
-                task_grads = torch.autograd.grad(
-                    query_loss, self.model.get_lora_parameters(),
-                    retain_graph=False, allow_unused=True
-                )
-                
-                # Accumulate gradients (FOMAML: use gradients from adapted params)
-                if len(accumulated_grads) == 0:
-                    accumulated_grads = [g.clone() if g is not None else torch.zeros_like(p) 
-                                       for g, p in zip(task_grads, self.model.get_lora_parameters())]
-                else:
-                    for i, g in enumerate(task_grads):
-                        if g is not None:
-                            accumulated_grads[i] += g
-                            
-            # Add task loss to total for logging
-            total_loss_for_logging += task_query_loss
-                
-        # Restore original parameters before applying meta-gradients
+        # Restore original parameters before backward pass
         for p, orig_p in zip(self.model.get_lora_parameters(), original_params):
             p.data = orig_p.data
             
-        # Apply accumulated gradients to original parameters (averaged across tasks)
-        for p, grad in zip(self.model.get_lora_parameters(), accumulated_grads):
-            p.grad = grad / len(task_batch)
-                
+        # Average loss across tasks and do single backward pass
+        total_loss = total_loss / len(task_batch)
+        total_loss.backward()
+        
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.model.get_lora_parameters(), max_norm=1.0)
         
         self.meta_optimizer.step()
         
-        # Return average loss for logging
-        return total_loss_for_logging / len(task_batch)
+        return total_loss.item()
     
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
         """Evaluate on test tasks."""
