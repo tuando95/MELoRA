@@ -24,6 +24,22 @@ from analysis import Analyzer
 import utils
 
 
+class NumpyEncoder(json.JSONEncoder):
+    """Custom JSON encoder that handles numpy types."""
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.int64, np.int32, np.int16, np.int8)):
+            return int(obj)
+        elif isinstance(obj, (np.float64, np.float32, np.float16)):
+            return float(obj)
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, (np.datetime64, np.timedelta64)):
+            return str(obj)
+        return super().default(obj)
+
+
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -482,7 +498,7 @@ def main():
                 config['experiment']['output_dir'], 'baseline_training_results.json'
             )
             with open(baseline_results_path, 'w') as f:
-                json.dump(results, f, indent=2)
+                json.dump(results, f, indent=2, cls=NumpyEncoder)
             logger.info(f"Baseline training results saved to {baseline_results_path}")
             
             # Save comparison results as CSV if we have evaluation results

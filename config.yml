@@ -128,7 +128,7 @@ memory_optimization:
   
   # Hessian Approximation
   hessian_approximation:
-    enabled: false  # Disable second-order for speed
+    enabled: true  # Enable second-order gradients for better performance
     method: "diagonal"  # diagonal, gauss_newton, block_diagonal, or none
     hutchinson_samples: 10  # For diagonal estimation
     low_rank_hessian: 32  # Rank for low-rank approximation
