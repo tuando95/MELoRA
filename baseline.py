@@ -123,6 +123,37 @@ class BaselineMethod(ABC):
         
         return "\n".join(summary)
 
+    def _get_num_classes_from_data(self, data: List[Dict]) -> int:
+        """Extract number of classes from task data."""
+        if not data:
+            self.logger.warning("Empty dataset provided, using default number of classes")
+            return self.model.max_num_labels  # Default fallback
+        
+        try:
+            labels = [example['label'] for example in data]
+            unique_labels = set(labels)
+            num_classes = len(unique_labels)
+            
+            # Validate labels are in expected range
+            min_label, max_label = min(unique_labels), max(unique_labels)
+            if min_label < 0:
+                raise ValueError(f"Found negative label: {min_label}")
+            
+            # Use max_label + 1 as number of classes to handle non-contiguous labels
+            num_classes = max_label + 1
+            
+            if num_classes > self.model.max_num_labels:
+                self.logger.warning(f"Task has {num_classes} classes, but model supports max {self.model.max_num_labels}")
+                
+            return min(num_classes, self.model.max_num_labels)
+            
+        except KeyError as e:
+            self.logger.error(f"Missing 'label' key in data: {e}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Error extracting number of classes: {e}")
+            raise
+
 
 class FullMAML(BaselineMethod):
     """Full second-order MAML baseline (memory-intensive)."""
@@ -262,37 +293,6 @@ class FullMAML(BaselineMethod):
             raise
         except Exception as e:
             self.logger.error(f"Error during meta-training step: {e}")
-            raise
-    
-    def _get_num_classes_from_data(self, data: List[Dict]) -> int:
-        """Extract number of classes from task data."""
-        if not data:
-            self.logger.warning("Empty dataset provided, using default number of classes")
-            return self.model.max_num_labels  # Default fallback
-        
-        try:
-            labels = [example['label'] for example in data]
-            unique_labels = set(labels)
-            num_classes = len(unique_labels)
-            
-            # Validate labels are in expected range
-            min_label, max_label = min(unique_labels), max(unique_labels)
-            if min_label < 0:
-                raise ValueError(f"Found negative label: {min_label}")
-            
-            # Use max_label + 1 as number of classes to handle non-contiguous labels
-            num_classes = max_label + 1
-            
-            if num_classes > self.model.max_num_labels:
-                self.logger.warning(f"Task has {num_classes} classes, but model supports max {self.model.max_num_labels}")
-                
-            return min(num_classes, self.model.max_num_labels)
-            
-        except KeyError as e:
-            self.logger.error(f"Missing 'label' key in data: {e}")
-            raise
-        except Exception as e:
-            self.logger.error(f"Error extracting number of classes: {e}")
             raise
     
     def _create_param_dict(self, fast_weights: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -719,6 +719,7 @@ class StandardFineTuning(BaselineMethod):
         self.ft_config = self._get_method_config('fine_tuning')
         self.lr = self.ft_config['lr']
         self.epochs = self.ft_config['epochs']
+        self.optimizer = None  # Will be created during training
         
     def train(self, meta_train_tasks: List[Tuple[List, List]], 
              meta_val_tasks: Optional[List[Tuple[List, List]]] = None):
@@ -738,8 +739,8 @@ class StandardFineTuning(BaselineMethod):
             
         self.logger.info(f"Combined training dataset size: {len(all_train_data)} examples")
         
-        # Create optimizer for ALL parameters
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        # Create optimizer for ALL parameters and store it as instance variable
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         
         # Log initial memory usage
         initial_memory = self.memory_profiler.profile_memory('standard_ft_initial')
@@ -774,13 +775,13 @@ class StandardFineTuning(BaselineMethod):
                 loss = outputs['loss']
                 
                 # Backward pass
-                optimizer.zero_grad()
+                self.optimizer.zero_grad()
                 loss.backward()
                 
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 
-                optimizer.step()
+                self.optimizer.step()
                 
                 epoch_loss += loss.item()
                 num_batches += 1
@@ -796,6 +797,14 @@ class StandardFineTuning(BaselineMethod):
                 self.logger.info(f"Memory after epoch {epoch+1}: {memory_stats}")
         
         self.logger.info("Standard fine-tuning completed")
+        
+    def save_checkpoint(self, filepath: str, metrics: Optional[Dict] = None):
+        """Save model checkpoint with optimizer state."""
+        if self.optimizer is not None:
+            self.model.save_checkpoint(filepath, optimizer=self.optimizer, metrics=metrics)
+        else:
+            # Fallback to model-only checkpoint
+            self.model.save_checkpoint(filepath, metrics=metrics)
         
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
         """Evaluate by fine-tuning ALL parameters from scratch."""
@@ -826,6 +835,7 @@ class LoRAFineTuning(BaselineMethod):
         self.ft_config = self._get_method_config('lora_fine_tuning')
         self.lr = self.ft_config['lr']
         self.epochs = self.ft_config['epochs']
+        self.optimizer = None  # Will be created during training
         
     def train(self, meta_train_tasks: List[Tuple[List, List]], 
              meta_val_tasks: Optional[List[Tuple[List, List]]] = None):
@@ -845,8 +855,8 @@ class LoRAFineTuning(BaselineMethod):
             
         self.logger.info(f"Combined training dataset size: {len(all_train_data)} examples")
         
-        # Create optimizer for ONLY LoRA parameters
-        optimizer = torch.optim.Adam(self.model.get_lora_parameters(), lr=self.lr)
+        # Create optimizer for ONLY LoRA parameters and store it as instance variable
+        self.optimizer = torch.optim.Adam(self.model.get_lora_parameters(), lr=self.lr)
         
         # Log initial memory usage
         initial_memory = self.memory_profiler.profile_memory('lora_ft_initial')
@@ -881,13 +891,13 @@ class LoRAFineTuning(BaselineMethod):
                 loss = outputs['loss']
                 
                 # Backward pass
-                optimizer.zero_grad()
+                self.optimizer.zero_grad()
                 loss.backward()
                 
                 # Gradient clipping for LoRA parameters
                 torch.nn.utils.clip_grad_norm_(self.model.get_lora_parameters(), max_norm=1.0)
                 
-                optimizer.step()
+                self.optimizer.step()
                 
                 epoch_loss += loss.item()
                 num_batches += 1
@@ -903,6 +913,14 @@ class LoRAFineTuning(BaselineMethod):
                 self.logger.info(f"Memory after epoch {epoch+1}: {memory_stats}")
         
         self.logger.info("LoRA fine-tuning completed")
+        
+    def save_checkpoint(self, filepath: str, metrics: Optional[Dict] = None):
+        """Save model checkpoint with optimizer state."""
+        if self.optimizer is not None:
+            self.model.save_checkpoint(filepath, optimizer=self.optimizer, metrics=metrics)
+        else:
+            # Fallback to model-only checkpoint
+            self.model.save_checkpoint(filepath, metrics=metrics)
         
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
         """Evaluate by fine-tuning LoRA parameters ONLY on each task."""

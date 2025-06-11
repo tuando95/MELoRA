@@ -353,14 +353,14 @@ baselines:
       enabled: true
       config:
         lr: 0.001
-        epochs: 10
+        epochs: 3
     
     - name: "lora_fine_tuning"
       enabled: true
       config:
         lr: 0.001
         rank: 8
-        epochs: 10
+        epochs: 3
     
     - name: "prototypical_networks"
       enabled: false
