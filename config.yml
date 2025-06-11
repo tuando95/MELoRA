@@ -286,9 +286,9 @@ training:
     mode: "min"
   
   # Training Control
-  max_epochs: 100
-  log_interval: 10
-  eval_interval: 100
+  max_epochs: 200
+  log_interval: 20
+  eval_interval: 50
   save_interval: 500
   num_workers: 16
   pin_memory: true
@@ -460,12 +460,14 @@ analysis:
   
   # Ablation Studies
   ablation:
+    enabled: true
     components: ["checkpointing", "hessian", "gradient_accumulation", "lora_rank"]
     interaction_analysis: true
     sensitivity_analysis: true
   
   # Statistical Analysis
   statistics:
+    enabled: true
     test_type: "paired_t_test"
     effect_size: "cohen_d"
     power_analysis: true
@@ -473,6 +475,7 @@ analysis:
   
   # Report Generation
   report:
+    enabled: true
     format: ["html", "latex", "markdown"]
     include_tables: true
     include_figures: true
