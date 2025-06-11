@@ -69,7 +69,7 @@ models:
 # LoRA Configuration
 lora:
   ranks: [4, 8, 16, 32]  # List of ranks to experiment with
-  default_rank: 8
+  default_rank: 16
   alpha: null  # If null, alpha = rank (following Hu et al., 2021)
   dropout: 0.1
   target_modules:  # Modules to apply LoRA
@@ -87,7 +87,7 @@ meta_learning:
   # Inner loop (task adaptation)
   inner:
     learning_rates: [0.001, 0.005, 0.01, 0.02]  # Grid search values
-    default_lr: 0.005  # Reduced for second-order stability
+    default_lr: 0.01  # Increased for second-order methods (better curvature handling)
     num_steps_options: [1, 3, 5]  # K-step adaptation
     default_num_steps: 1  # Reduced from 3 for speed
     optimizer: "sgd"  # sgd or adam for inner loop
@@ -95,7 +95,7 @@ meta_learning:
   # Outer loop (meta-update)
   outer:
     learning_rates: [0.0001, 0.0005, 0.001, 0.002]  # Grid search values
-    default_lr: 0.0005  # Reduced for second-order methods
+    default_lr: 0.001  # Increased for second-order methods
     optimizer: "adamw"
     optimizer_params:
       betas: [0.9, 0.999]
@@ -130,7 +130,7 @@ memory_optimization:
   hessian_approximation:
     enabled: true  # Enable second-order gradients for better performance
     method: "diagonal"  # diagonal, gauss_newton, block_diagonal, or none
-    hutchinson_samples: 25  # Increased for better estimation (was 10)
+    hutchinson_samples: 50  # Increased for much better estimation (was 25)
     low_rank_hessian: 32  # Rank for low-rank approximation
   
   # Memory Management

@@ -416,11 +416,11 @@ class MELoRATrainer:
                 param_hessian = diag_hessian[param_idx:param_idx + param_size]
                 param_hessian = param_hessian.reshape(param.shape)
                 
-                # BUG FIX: Use proper second-order update formula
-                # Instead of: grad - α * H * grad (which is wrong)
-                # Use: grad / (1 + α * H) (proper Newton-like step)
-                denominator = 1.0 + self.inner_lr * torch.abs(param_hessian)
-                meta_grad = grad / torch.clamp(denominator, min=1e-8)
+                # FIXED: Proper Newton-like step (no abs, better regularization)
+                # Newton update: grad - α * H^(-1) * grad ≈ grad / (1 + α * H)
+                denominator = 1.0 + self.inner_lr * param_hessian
+                # Better regularization for numerical stability
+                meta_grad = grad / torch.clamp(denominator, min=0.1, max=10.0)
                 
                 meta_grads.append(meta_grad)
                 param_idx += param_size
