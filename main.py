@@ -254,7 +254,10 @@ def train_baselines_only(config: Dict,
         baseline_methods = [m['name'] for m in config['baselines']['methods'] if m['enabled']]
         logger.info(f"Training all enabled baselines: {baseline_methods}")
     
-    # Train each baseline
+    # Prepare test tasks for evaluation
+    test_tasks = datasets['test'][:args.num_test_tasks]
+    
+    # Train and evaluate each baseline
     for baseline_name in baseline_methods:
         logger.info(f"Training baseline: {baseline_name}")
         
@@ -277,16 +280,17 @@ def train_baselines_only(config: Dict,
             baseline_model.save_checkpoint(checkpoint_path)
             logger.info(f"Saved {baseline_name} checkpoint to {checkpoint_path}")
             
-            # Store result (just training completion for now)
-            results[baseline_name] = {
-                'training_completed': True,
-                'checkpoint_path': checkpoint_path
-            }
+            # Evaluate baseline
+            logger.info(f"Evaluating {baseline_name}...")
+            baseline_results = baseline_model.evaluate(test_tasks)
+            results[baseline_name] = baseline_results
+            logger.info(f"{baseline_name} evaluation results: {baseline_results}")
             
         except Exception as e:
-            logger.error(f"Failed to train {baseline_name}: {e}", exc_info=True)
+            logger.error(f"Failed to train/evaluate {baseline_name}: {e}", exc_info=True)
             results[baseline_name] = {
                 'training_completed': False,
+                'evaluation_completed': False,
                 'error': str(e)
             }
     
@@ -480,6 +484,13 @@ def main():
             with open(baseline_results_path, 'w') as f:
                 json.dump(results, f, indent=2)
             logger.info(f"Baseline training results saved to {baseline_results_path}")
+            
+            # Save comparison results as CSV if we have evaluation results
+            if results and any('accuracy_mean' in v for v in results.values() if isinstance(v, dict)):
+                comparison_df = pd.DataFrame(results).T
+                comparison_csv_path = os.path.join(config['experiment']['output_dir'], 'baseline_comparison_results.csv')
+                comparison_df.to_csv(comparison_csv_path)
+                logger.info(f"Baseline comparison results saved to {comparison_csv_path}")
             
         # MELoRA training mode
         elif args.mode in ['train', 'full']:

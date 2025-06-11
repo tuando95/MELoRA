@@ -792,7 +792,7 @@ class StandardFineTuning(BaselineMethod):
             self.logger.info(f"Epoch {epoch+1}: Average Loss = {avg_epoch_loss:.4f}")
             
             # Memory tracking every few epochs
-            if (epoch + 1) % 3 == 0:
+            if (epoch + 1) % 1 == 0:
                 memory_stats = self.memory_profiler.profile_memory(f'standard_ft_epoch_{epoch+1}')
                 self.logger.info(f"Memory after epoch {epoch+1}: {memory_stats}")
         
@@ -908,7 +908,7 @@ class LoRAFineTuning(BaselineMethod):
             self.logger.info(f"Epoch {epoch+1}: Average Loss = {avg_epoch_loss:.4f}")
             
             # Memory tracking every few epochs
-            if (epoch + 1) % 3 == 0:
+            if (epoch + 1) % 1 == 0:
                 memory_stats = self.memory_profiler.profile_memory(f'lora_ft_epoch_{epoch+1}')
                 self.logger.info(f"Memory after epoch {epoch+1}: {memory_stats}")
         
