@@ -480,6 +480,7 @@ class FOMAML(BaselineMethod):
         self.meta_optimizer.zero_grad()
         
         total_loss = 0.0
+        accumulated_grads = []
         
         # Save original parameters once
         original_params = [p.clone() for p in self.model.get_lora_parameters()]
@@ -493,7 +494,9 @@ class FOMAML(BaselineMethod):
             for p, orig_p in zip(self.model.get_lora_parameters(), original_params):
                 p.data = orig_p.data.clone()
             
-            # Inner loop adaptation (SGD on current task)
+            # Inner loop adaptation - create adapted parameters
+            adapted_params = [p.clone().detach().requires_grad_(True) for p in self.model.get_lora_parameters()]
+            
             for _ in range(self.inner_steps):
                 support_loader = self.dataset_loader.get_data_loader(
                     support_set, batch_size=len(support_set)
@@ -501,46 +504,98 @@ class FOMAML(BaselineMethod):
                 
                 for batch in support_loader:
                     batch = utils.move_to_device(batch, self.device)
+                    
+                    # Temporarily use adapted parameters
+                    original_model_params = self._replace_parameters(adapted_params)
                     outputs = self.model(**batch)
                     loss = outputs['loss']
+                    self._replace_parameters(original_model_params)
                     
-                    # Manual gradient computation and update (no optimizer needed)
+                    # Compute gradients w.r.t. adapted parameters
                     grads = torch.autograd.grad(
-                        loss, self.model.get_lora_parameters(), 
+                        loss, adapted_params, 
                         create_graph=False, retain_graph=False, allow_unused=True
                     )
                     
-                    # Update parameters manually
-                    with torch.no_grad():
-                        for p, g in zip(self.model.get_lora_parameters(), grads):
-                            if g is not None:
-                                p.data = p.data - self.inner_lr * g
-                    
-            # Compute query loss at adapted parameters
+                    # Update adapted parameters
+                    new_adapted_params = []
+                    for p, g in zip(adapted_params, grads):
+                        if g is not None:
+                            new_adapted_params.append((p - self.inner_lr * g).requires_grad_(True))
+                        else:
+                            new_adapted_params.append(p.requires_grad_(True))
+                    adapted_params = new_adapted_params
+            
+            # Compute query loss with adapted parameters
             query_loader = self.dataset_loader.get_data_loader(
                 query_set, batch_size=len(query_set)
             )
             
             for batch in query_loader:
                 batch = utils.move_to_device(batch, self.device)
+                
+                # Use adapted parameters for forward pass
+                original_model_params = self._replace_parameters(adapted_params)
                 outputs = self.model(**batch)
                 query_loss = outputs['loss']
-                total_loss += query_loss
+                self._replace_parameters(original_model_params)
                 
-        # Restore original parameters before backward pass
+                total_loss += query_loss.item()  # For logging
+                
+                # FOMAML: Compute gradients w.r.t. ORIGINAL parameters
+                task_grads = torch.autograd.grad(
+                    query_loss, original_params,
+                    retain_graph=False, allow_unused=True
+                )
+                
+                # Accumulate gradients
+                if len(accumulated_grads) == 0:
+                    accumulated_grads = [g.clone() if g is not None else torch.zeros_like(p) 
+                                       for g, p in zip(task_grads, original_params)]
+                else:
+                    for i, g in enumerate(task_grads):
+                        if g is not None:
+                            accumulated_grads[i] += g
+                
+        # Restore original parameters
         for p, orig_p in zip(self.model.get_lora_parameters(), original_params):
             p.data = orig_p.data
             
-        # Average loss across tasks and do single backward pass
-        total_loss = total_loss / len(task_batch)
-        total_loss.backward()
+        # Apply accumulated gradients to original parameters
+        for p, grad in zip(self.model.get_lora_parameters(), accumulated_grads):
+            p.grad = grad / len(task_batch)
         
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.model.get_lora_parameters(), max_norm=1.0)
         
         self.meta_optimizer.step()
         
-        return total_loss.item()
+        return total_loss / len(task_batch)
+    
+    def _replace_parameters(self, new_params: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Temporarily replace model parameters and return original."""
+        original_params = []
+        param_idx = 0
+        
+        # Replace LoRA parameters
+        for lora_layer in self.model.lora_layers.values():
+            # lora_A
+            original_params.append(lora_layer.lora_A.data.clone())
+            lora_layer.lora_A.data = new_params[param_idx]
+            param_idx += 1
+            
+            # lora_B
+            original_params.append(lora_layer.lora_B.data.clone())
+            lora_layer.lora_B.data = new_params[param_idx]
+            param_idx += 1
+            
+        # Replace classifier parameters
+        for param in self.model.classifier.parameters():
+            original_params.append(param.data.clone())
+            param.data = new_params[param_idx]
+            param_idx += 1
+            
+        return original_params
     
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
         """Evaluate on test tasks."""
