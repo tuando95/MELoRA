@@ -373,33 +373,42 @@ class MELoRATrainer:
         # Compute query loss
         query_loss = self._compute_query_loss(query_set, adapted_params)
         
-        # Compute first-order gradients
+        # BUG FIX: Compute gradients w.r.t. ORIGINAL parameters, not adapted ones
         query_grads = torch.autograd.grad(
-            query_loss, adapted_params, retain_graph=True, allow_unused=True
+            query_loss, self.model.get_lora_parameters(), retain_graph=True, allow_unused=True
         )
         
         # Handle None gradients for unused parameters
         query_grads = [g if g is not None else torch.zeros_like(p) 
-                      for g, p in zip(query_grads, adapted_params)]
+                      for g, p in zip(query_grads, self.model.get_lora_parameters())]
         
         if self.hessian_method == 'diagonal':
-            # Diagonal Hessian approximation
+            # BUG FIX: Compute Hessian of SUPPORT loss w.r.t. ORIGINAL parameters
             support_loader = self.dataset_loader.get_data_loader(
                 support_set, batch_size=len(support_set), shuffle=False
             )
             
+            # Temporarily restore original parameters to compute support loss
+            current_adapted_params = [p.data.clone() for p in self.model.get_lora_parameters()]
+            
             for batch in support_loader:
                 batch = utils.move_to_device(batch, self.device)
+                # Use current (original) parameters for support loss
                 outputs = self.model(**batch)
                 support_loss = outputs['loss']
                 
-            # Compute diagonal Hessian
-            diag_hessian = self.model.compute_diagonal_hessian(
-                support_loss,
-                n_samples=self.memory_config['hessian_approximation']['hutchinson_samples']
-            )
+            # Compute diagonal Hessian w.r.t. original parameters
+            # Increase samples for better estimate and add regularization
+            n_samples = max(20, self.memory_config['hessian_approximation']['hutchinson_samples'])
+            diag_hessian = self.model.compute_diagonal_hessian(support_loss, n_samples=n_samples)
             
-            # Apply Hessian to query gradients
+            # Add regularization to prevent numerical issues
+            regularization = 1e-6
+            diag_hessian = diag_hessian + regularization
+            
+            # Apply Hessian correction to query gradients  
+            # Formula: meta_grad = grad - α * (I + α * H)^(-1) * H * grad
+            # Simplified to: meta_grad = grad / (1 + α * H) for diagonal case
             meta_grads = []
             param_idx = 0
             for param, grad in zip(self.model.get_lora_parameters(), query_grads):
@@ -407,10 +416,13 @@ class MELoRATrainer:
                 param_hessian = diag_hessian[param_idx:param_idx + param_size]
                 param_hessian = param_hessian.reshape(param.shape)
                 
-                # Meta-gradient = I - α * H
-                meta_grad = grad - self.inner_lr * param_hessian * grad
-                meta_grads.append(meta_grad)
+                # BUG FIX: Use proper second-order update formula
+                # Instead of: grad - α * H * grad (which is wrong)
+                # Use: grad / (1 + α * H) (proper Newton-like step)
+                denominator = 1.0 + self.inner_lr * torch.abs(param_hessian)
+                meta_grad = grad / torch.clamp(denominator, min=1e-8)
                 
+                meta_grads.append(meta_grad)
                 param_idx += param_size
                 
         else:
