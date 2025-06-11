@@ -479,7 +479,7 @@ class FOMAML(BaselineMethod):
         self.model.train()
         self.meta_optimizer.zero_grad()
         
-        total_loss = 0.0
+        total_loss_for_logging = 0.0  # For logging only
         accumulated_grads = []
         
         # Save original parameters once
@@ -528,11 +528,10 @@ class FOMAML(BaselineMethod):
                 outputs = self.model(**batch)
                 query_loss = outputs['loss']
                 
-                # BUG FIX: Keep tensor for gradient computation, not .item()
-                total_loss += query_loss
-                task_query_loss += query_loss.item()  # For logging only
+                # For logging: accumulate scalar loss values
+                task_query_loss += query_loss.item()
                 
-                # Compute gradients w.r.t. adapted parameters
+                # Compute gradients w.r.t. adapted parameters (individual gradients)
                 task_grads = torch.autograd.grad(
                     query_loss, self.model.get_lora_parameters(),
                     retain_graph=False, allow_unused=True
@@ -546,12 +545,15 @@ class FOMAML(BaselineMethod):
                     for i, g in enumerate(task_grads):
                         if g is not None:
                             accumulated_grads[i] += g
+                            
+            # Add task loss to total for logging
+            total_loss_for_logging += task_query_loss
                 
         # Restore original parameters before applying meta-gradients
         for p, orig_p in zip(self.model.get_lora_parameters(), original_params):
             p.data = orig_p.data
             
-        # Apply accumulated gradients to original parameters
+        # Apply accumulated gradients to original parameters (averaged across tasks)
         for p, grad in zip(self.model.get_lora_parameters(), accumulated_grads):
             p.grad = grad / len(task_batch)
                 
@@ -560,8 +562,8 @@ class FOMAML(BaselineMethod):
         
         self.meta_optimizer.step()
         
-        # BUG FIX: total_loss is now a tensor, convert to item for return
-        return total_loss.item() / len(task_batch)
+        # Return average loss for logging
+        return total_loss_for_logging / len(task_batch)
     
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
         """Evaluate on test tasks."""
