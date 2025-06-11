@@ -527,7 +527,10 @@ class FOMAML(BaselineMethod):
                 batch = utils.move_to_device(batch, self.device)
                 outputs = self.model(**batch)
                 query_loss = outputs['loss']
-                task_query_loss += query_loss.item()
+                
+                # BUG FIX: Keep tensor for gradient computation, not .item()
+                total_loss += query_loss
+                task_query_loss += query_loss.item()  # For logging only
                 
                 # Compute gradients w.r.t. adapted parameters
                 task_grads = torch.autograd.grad(
@@ -543,8 +546,6 @@ class FOMAML(BaselineMethod):
                     for i, g in enumerate(task_grads):
                         if g is not None:
                             accumulated_grads[i] += g
-                        
-            total_loss += task_query_loss
                 
         # Restore original parameters before applying meta-gradients
         for p, orig_p in zip(self.model.get_lora_parameters(), original_params):
@@ -559,7 +560,8 @@ class FOMAML(BaselineMethod):
         
         self.meta_optimizer.step()
         
-        return total_loss / len(task_batch)
+        # BUG FIX: total_loss is now a tensor, convert to item for return
+        return total_loss.item() / len(task_batch)
     
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
         """Evaluate on test tasks."""
@@ -591,6 +593,7 @@ class Reptile(BaselineMethod):
         self.inner_steps = self.meta_config['inner_steps']
         self.epsilon = self.meta_config['epsilon']
         self.meta_batch_size = self.config['meta_learning']['default_meta_batch_size']
+        self.optimizer = None  # Will be created during training
         
     def train(self, meta_train_tasks: List[Tuple[List, List]], 
              meta_val_tasks: Optional[List[Tuple[List, List]]] = None):
@@ -601,6 +604,9 @@ class Reptile(BaselineMethod):
         num_iterations = self.config['meta_learning']['num_meta_iterations']
         
         self.logger.info("Starting Reptile training")
+        
+        # Create a dummy optimizer for checkpoint saving (Reptile doesn't use meta-optimizer)
+        self.optimizer = torch.optim.SGD(self.model.get_lora_parameters(), lr=self.lr)
         
         # Log initial memory usage
         initial_memory = self.memory_profiler.profile_memory('reptile_initial')
@@ -709,6 +715,15 @@ class Reptile(BaselineMethod):
         
         # Return full results in same format as MELoRA for CSV compatibility
         return results
+    
+    def save_checkpoint(self, filepath: str, metrics: Optional[Dict] = None):
+        """Save model checkpoint with optimizer state."""
+        if self.optimizer is not None:
+            self.model.save_checkpoint(filepath, optimizer=self.optimizer, metrics=metrics)
+        else:
+            # Create a dummy optimizer if none exists
+            dummy_optimizer = torch.optim.SGD(self.model.get_lora_parameters(), lr=self.lr)
+            self.model.save_checkpoint(filepath, optimizer=dummy_optimizer, metrics=metrics)
 
 
 class StandardFineTuning(BaselineMethod):

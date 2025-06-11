@@ -338,9 +338,9 @@ baselines:
     - name: "fomaml"
       enabled: true
       config:
-        inner_lr: 0.001
-        outer_lr: 0.0001
-        inner_steps: 1
+        inner_lr: 0.01
+        outer_lr: 0.001
+        inner_steps: 3
     
     - name: "reptile"
       enabled: true
