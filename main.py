@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple, Optional, Any
 
 import torch
 import numpy as np
+import pandas as pd
 
 # Import all modules
 from dataset_loader import DatasetLoader
@@ -25,7 +26,24 @@ import utils
 
 def parse_arguments():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='MELoRA: Memory-Efficient LoRA Meta-Learning')
+    parser = argparse.ArgumentParser(
+        description='MELoRA: Memory-Efficient LoRA Meta-Learning',
+        epilog="""
+        Examples:
+        # Train all baselines only
+        python main.py --baselines_only
+        
+        # Train specific baselines only
+        python main.py --baselines_only --baseline_methods fomaml reptile
+        
+        # Train only fine-tuning baselines
+        python main.py --mode baselines_only --baseline_methods fine_tuning lora_fine_tuning
+        
+        # Full MELoRA experiment (default)
+        python main.py --mode full
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     
     # Experiment configuration
     parser.add_argument('--config', type=str, default='config.yml',
@@ -35,12 +53,21 @@ def parse_arguments():
     
     # Mode selection
     parser.add_argument('--mode', type=str, default='full',
-                       choices=['train', 'evaluate', 'analyze', 'full'],
+                       choices=['train', 'evaluate', 'analyze', 'full', 'baselines_only'],
                        help='Experiment mode')
     parser.add_argument('--skip_baselines', action='store_true',
                        help='Skip baseline comparisons')
     parser.add_argument('--synthetic_only', action='store_true',
                        help='Use only synthetic data')
+    
+    # Baseline-specific options
+    parser.add_argument('--baselines_only', action='store_true',
+                       help='Train only baselines (skip MELoRA)')
+    parser.add_argument('--baseline_methods', nargs='+', 
+                       choices=['full_maml', 'fomaml', 'reptile', 'fine_tuning', 'lora_fine_tuning'],
+                       help='Specific baseline methods to train (if not specified, trains all enabled baselines)')
+    parser.add_argument('--skip_analysis', action='store_true',
+                       help='Skip comparative analysis')
     
     # Model selection
     parser.add_argument('--model', type=str, default=None,
@@ -205,6 +232,67 @@ def train_melora(config: Dict,
     return trainer
 
 
+def train_baselines_only(config: Dict,
+                        model: MELoRAModel,
+                        dataset_loader: DatasetLoader,
+                        datasets: Dict[str, List],
+                        args) -> Dict[str, Dict[str, Any]]:
+    """Train only baseline methods."""
+    logger = utils.get_logger()
+    results = {}
+    
+    # Ensure checkpoint directory exists
+    os.makedirs(config['experiment']['checkpoint_dir'], exist_ok=True)
+    
+    # Determine which baselines to train
+    if args.baseline_methods:
+        # Use specified baseline methods
+        baseline_methods = args.baseline_methods
+        logger.info(f"Training specified baselines: {baseline_methods}")
+    else:
+        # Use all enabled baselines from config
+        baseline_methods = [m['name'] for m in config['baselines']['methods'] if m['enabled']]
+        logger.info(f"Training all enabled baselines: {baseline_methods}")
+    
+    # Train each baseline
+    for baseline_name in baseline_methods:
+        logger.info(f"Training baseline: {baseline_name}")
+        
+        try:
+            # Create baseline model
+            baseline_model = create_baseline(
+                baseline_name, model, config, dataset_loader
+            )
+            
+            # Train baseline
+            logger.info(f"Starting training for {baseline_name}...")
+            baseline_model.train(datasets['train'], datasets['val'])
+            logger.info(f"Completed training for {baseline_name}")
+            
+            # Save checkpoint
+            checkpoint_path = os.path.join(
+                config['experiment']['checkpoint_dir'], 
+                f'{baseline_name}_checkpoint.pt'
+            )
+            baseline_model.save_checkpoint(checkpoint_path)
+            logger.info(f"Saved {baseline_name} checkpoint to {checkpoint_path}")
+            
+            # Store result (just training completion for now)
+            results[baseline_name] = {
+                'training_completed': True,
+                'checkpoint_path': checkpoint_path
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to train {baseline_name}: {e}", exc_info=True)
+            results[baseline_name] = {
+                'training_completed': False,
+                'error': str(e)
+            }
+    
+    return results
+
+
 def evaluate_methods(config: Dict,
                     model: MELoRAModel,
                     dataset_loader: DatasetLoader,
@@ -248,9 +336,9 @@ def evaluate_methods(config: Dict,
                     baseline_name, model, config, dataset_loader
                 )
                 
-                # Train baseline if needed (using full training data for fair comparison)
-                if baseline_name not in ['fine_tuning', 'lora_fine_tuning']:
-                    baseline_model.train(datasets['train'], datasets['val'])
+                # Train baseline (using full training data for fair comparison)
+                # All baselines should be trained, including fine-tuning methods
+                baseline_model.train(datasets['train'], datasets['val'])
                     
                 # Evaluate baseline
                 baseline_results = baseline_model.evaluate(test_tasks)
@@ -380,12 +468,25 @@ def main():
         trainer = None
         results = {}
         
-        # Training mode
-        if args.mode in ['train', 'full']:
+        # Handle baseline-only mode
+        if args.mode == 'baselines_only' or args.baselines_only:
+            logger.info("Running in baselines-only mode")
+            results = train_baselines_only(config, model, dataset_loader, datasets, args)
+            
+            # Save baseline training results
+            baseline_results_path = os.path.join(
+                config['experiment']['output_dir'], 'baseline_training_results.json'
+            )
+            with open(baseline_results_path, 'w') as f:
+                json.dump(results, f, indent=2)
+            logger.info(f"Baseline training results saved to {baseline_results_path}")
+            
+        # MELoRA training mode
+        elif args.mode in ['train', 'full']:
             trainer = train_melora(config, model, dataset_loader, datasets, args)
             
         # Evaluation mode
-        if args.mode in ['evaluate', 'full']:
+        if args.mode in ['evaluate', 'full'] and not (args.baselines_only or args.mode == 'baselines_only'):
             results = evaluate_methods(
                 config, model, dataset_loader, datasets, datasets['test'], args
             )
@@ -396,8 +497,9 @@ def main():
                 os.path.join(config['experiment']['output_dir'], 'comparison_results.csv')
             )
             
-        # Analysis mode
-        if args.mode in ['analyze', 'full'] and results:
+        # Analysis mode (skip if requested or in baselines-only mode)
+        if (args.mode in ['analyze', 'full'] and results and 
+            not args.skip_analysis and not (args.baselines_only or args.mode == 'baselines_only')):
             analyze_results(
                 config, results, model, dataset_loader, datasets['test'], args
             )

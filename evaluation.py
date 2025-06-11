@@ -61,12 +61,15 @@ class Evaluator:
     def evaluate_meta_learning(self,
                              test_tasks: List[Tuple[List, List]],
                              adaptation_steps: Optional[int] = None,
-                             adaptation_lr: Optional[float] = None) -> Dict[str, Any]:
+                             adaptation_lr: Optional[float] = None,
+                             optimize_all_params: Optional[bool] = None) -> Dict[str, Any]:
         """Evaluate meta-learning model on test tasks."""
         if adaptation_steps is None:
             adaptation_steps = self.config['meta_learning']['inner']['default_num_steps']
         if adaptation_lr is None:
             adaptation_lr = self.config['meta_learning']['inner']['default_lr']
+        if optimize_all_params is None:
+            optimize_all_params = False  # Default to LoRA-only optimization
             
         self.logger.info(f"Evaluating on {len(test_tasks)} test tasks")
         self.logger.info(f"Adaptation steps: {adaptation_steps}, LR: {adaptation_lr}")
@@ -86,7 +89,7 @@ class Evaluator:
             task_metrics = self._evaluate_single_task(
                 support_set, query_set, 
                 adaptation_steps, adaptation_lr,
-                task_idx
+                task_idx, optimize_all_params
             )
             self.task_results.append(task_metrics)
             
@@ -115,13 +118,14 @@ class Evaluator:
                             query_set: List[Dict],
                             adaptation_steps: int,
                             adaptation_lr: float,
-                            task_idx: int) -> Dict[str, Any]:
+                            task_idx: int,
+                            optimize_all_params: bool = False) -> Dict[str, Any]:
         """Evaluate model on a single task."""
         start_time = time.time()
         
         # Adapt model to support set
         adapted_params = self._adapt_to_task(
-            support_set, adaptation_steps, adaptation_lr
+            support_set, adaptation_steps, adaptation_lr, optimize_all_params
         )
         
         adaptation_time = time.time() - start_time
@@ -162,18 +166,24 @@ class Evaluator:
     def _adapt_to_task(self,
                       support_set: List[Dict],
                       adaptation_steps: int,
-                      adaptation_lr: float) -> List[torch.Tensor]:
+                      adaptation_lr: float,
+                      optimize_all_params: bool = False) -> List[torch.Tensor]:
         """Adapt model parameters to a specific task."""
         # Set the number of classes for this task
         if hasattr(self.model, 'set_num_classes'):
             num_classes = self._get_num_classes_from_data(support_set)
             self.model.set_num_classes(num_classes)
             
-        # Get LoRA parameters
-        if hasattr(self.model, 'get_lora_parameters'):
-            adapted_params = [p.clone() for p in self.model.get_lora_parameters()]
-        else:
+        # Get parameters to optimize
+        if optimize_all_params:
+            # Optimize ALL trainable parameters (for standard fine-tuning)
             adapted_params = [p.clone() for p in self.model.parameters() if p.requires_grad]
+        else:
+            # Optimize only LoRA parameters (default behavior)
+            if hasattr(self.model, 'get_lora_parameters'):
+                adapted_params = [p.clone() for p in self.model.get_lora_parameters()]
+            else:
+                adapted_params = [p.clone() for p in self.model.parameters() if p.requires_grad]
             
         # Create data loader
         support_loader = self.dataset_loader.get_data_loader(
@@ -414,32 +424,46 @@ class Evaluator:
     def _replace_parameters(self, new_params: List[torch.Tensor]) -> List[torch.Tensor]:
         """Temporarily replace model parameters."""
         original_params = []
+        param_idx = 0
         
-        if hasattr(self.model, 'lora_layers'):
-            # MELoRA model
-            param_idx = 0
-            for lora_layer in self.model.lora_layers.values():
-                original_params.append(lora_layer.lora_A.data.clone())
-                lora_layer.lora_A.data = new_params[param_idx]
-                param_idx += 1
-                
-                original_params.append(lora_layer.lora_B.data.clone())
-                lora_layer.lora_B.data = new_params[param_idx]
-                param_idx += 1
-                
-            if hasattr(self.model, 'classifier'):
-                for param in self.model.classifier.parameters():
-                    original_params.append(param.data.clone())
-                    param.data = new_params[param_idx]
-                    param_idx += 1
-        else:
-            # Generic model
-            param_idx = 0
+        # Check if we're dealing with all parameters or just LoRA parameters
+        # based on the number of new_params vs model parameters
+        total_model_params = sum(1 for p in self.model.parameters() if p.requires_grad)
+        lora_params_count = len(list(self.model.get_lora_parameters())) if hasattr(self.model, 'get_lora_parameters') else 0
+        
+        if len(new_params) == total_model_params:
+            # Replace ALL trainable parameters (for standard fine-tuning)
             for param in self.model.parameters():
                 if param.requires_grad:
                     original_params.append(param.data.clone())
                     param.data = new_params[param_idx]
                     param_idx += 1
+        else:
+            # Replace only LoRA parameters (default behavior)
+            if hasattr(self.model, 'lora_layers'):
+                # MELoRA model - replace LoRA parameters
+                for lora_layer in self.model.lora_layers.values():
+                    original_params.append(lora_layer.lora_A.data.clone())
+                    lora_layer.lora_A.data = new_params[param_idx]
+                    param_idx += 1
+                    
+                    original_params.append(lora_layer.lora_B.data.clone())
+                    lora_layer.lora_B.data = new_params[param_idx]
+                    param_idx += 1
+                    
+                # Replace classifier parameters
+                if hasattr(self.model, 'classifier'):
+                    for param in self.model.classifier.parameters():
+                        original_params.append(param.data.clone())
+                        param.data = new_params[param_idx]
+                        param_idx += 1
+            else:
+                # Fallback for generic models
+                for param in self.model.parameters():
+                    if param.requires_grad:
+                        original_params.append(param.data.clone())
+                        param.data = new_params[param_idx]
+                        param_idx += 1
                     
         return original_params
     

@@ -394,12 +394,8 @@ class FullMAML(BaselineMethod):
         summary = self.generate_summary_statistics(results)
         self.logger.info(f"FullMAML Evaluation Results:\n{summary}")
         
-        # Extract the metrics that baselines expect
-        return {
-            'test_loss': results.get('loss_mean', 0.0),
-            'test_accuracy': results.get('accuracy_mean', 0.0),
-            'full_results': results  # Include full results for analysis
-        }
+        # Return full results in same format as MELoRA for CSV compatibility
+        return results
     
     def _adapt_to_task(self, support_set: List[Dict]) -> nn.Module:
         """Adapt model to a specific task."""
@@ -582,12 +578,8 @@ class FOMAML(BaselineMethod):
         summary = self.generate_summary_statistics(results)
         self.logger.info(f"FOMAML Evaluation Results:\n{summary}")
         
-        # Extract the metrics that baselines expect
-        return {
-            'test_loss': results.get('loss_mean', 0.0),
-            'test_accuracy': results.get('accuracy_mean', 0.0),
-            'full_results': results  # Include full results for analysis
-        }
+        # Return full results in same format as MELoRA for CSV compatibility
+        return results
 
 
 class Reptile(BaselineMethod):
@@ -617,55 +609,83 @@ class Reptile(BaselineMethod):
         
         pbar = tqdm(range(num_iterations), desc="Reptile Training")
         for iteration in pbar:
-            # Sample task
-            task_idx = np.random.choice(len(meta_train_tasks))
-            support_set, query_set = meta_train_tasks[task_idx]
+            # Sample meta-batch of tasks (not single task)
+            task_indices = np.random.choice(len(meta_train_tasks), 
+                                          self.meta_batch_size, replace=True)
+            task_batch = [meta_train_tasks[i] for i in task_indices]
             
-            # Set the number of classes for this task
-            num_classes = self._get_num_classes_from_data(support_set + query_set)
-            self.model.set_num_classes(num_classes)
-            
-            # Store initial parameters
+            # Store initial parameters before meta-update
             initial_params = [p.clone() for p in self.model.get_lora_parameters()]
             
-            # Inner loop optimization
-            optimizer = torch.optim.SGD(self.model.get_lora_parameters(), lr=self.lr)
-            
             total_loss = 0.0
-            num_batches = 0
+            total_batches = 0
+            accumulated_updates = [torch.zeros_like(p) for p in initial_params]
             
-            for _ in range(self.inner_steps):
-                support_loader = self.dataset_loader.get_data_loader(
-                    support_set, batch_size=len(support_set)
-                )
+            # Process each task in the meta-batch
+            for support_set, query_set in task_batch:
+                # Set the number of classes for this task
+                num_classes = self._get_num_classes_from_data(support_set + query_set)
+                self.model.set_num_classes(num_classes)
                 
-                for batch in support_loader:
-                    batch = utils.move_to_device(batch, self.device)
-                    outputs = self.model(**batch)
-                    loss = outputs['loss']
+                # Reset parameters to initial state for each task
+                for p, init_p in zip(self.model.get_lora_parameters(), initial_params):
+                    p.data = init_p.data.clone()
+                
+                # Inner loop optimization on support set
+                optimizer = torch.optim.SGD(self.model.get_lora_parameters(), lr=self.lr)
+                
+                task_loss = 0.0
+                task_batches = 0
+                
+                for _ in range(self.inner_steps):
+                    support_loader = self.dataset_loader.get_data_loader(
+                        support_set, batch_size=len(support_set)
+                    )
                     
-                    total_loss += loss.item()
-                    num_batches += 1
-                    
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    
-            # Reptile update: move towards adapted parameters
-            for p, init_p in zip(self.model.get_lora_parameters(), initial_params):
-                p.data = init_p + self.epsilon * (p.data - init_p)
+                    for batch in support_loader:
+                        batch = utils.move_to_device(batch, self.device)
+                        outputs = self.model(**batch)
+                        loss = outputs['loss']
+                        
+                        task_loss += loss.item()
+                        task_batches += 1
+                        
+                        optimizer.zero_grad()
+                        loss.backward()
+                        
+                        # Gradient clipping for stability
+                        torch.nn.utils.clip_grad_norm_(self.model.get_lora_parameters(), max_norm=1.0)
+                        
+                        optimizer.step()
+                
+                # Accumulate parameter updates (adapted_params - initial_params)
+                for i, (p, init_p) in enumerate(zip(self.model.get_lora_parameters(), initial_params)):
+                    accumulated_updates[i] += (p.data - init_p.data)
+                
+                total_loss += task_loss
+                total_batches += task_batches
+            
+            # Apply Reptile meta-update: move towards average of adapted parameters
+            # Use proper Reptile step size (epsilon should be close to 1.0 for good performance)
+            effective_epsilon = min(self.epsilon * 10.0, 1.0)  # Scale up epsilon for better learning
+            
+            for p, init_p, update in zip(self.model.get_lora_parameters(), initial_params, accumulated_updates):
+                # Average the updates across the meta-batch
+                avg_update = update / len(task_batch)
+                # Apply Reptile update: theta = theta + epsilon * (phi - theta)
+                p.data = init_p.data + effective_epsilon * avg_update
                 
             # Update progress bar with average loss
-            avg_loss = total_loss / num_batches if num_batches > 0 else 0
+            avg_loss = total_loss / total_batches if total_batches > 0 else 0
             pbar.set_postfix({'loss': f'{avg_loss:.4f}'})
                 
             # Logging with memory tracking
-            log_interval = self.config.get('training', {}).get('log_interval', 100)
+            log_interval = self.config.get('training', {}).get('log_interval', 10)
             if iteration % log_interval == 0:
                 self._log_training_metrics(iteration, avg_loss, 'Reptile')
                 
             # Validation
-            if meta_val_tasks and iteration % 100 == 0:
+            if meta_val_tasks and iteration % 50 == 0:
                 val_metrics = self.evaluate(meta_val_tasks[:50])  # Subset for speed
                 self.logger.info(f"Validation: {val_metrics}")
                 
@@ -688,12 +708,8 @@ class Reptile(BaselineMethod):
         summary = self.generate_summary_statistics(results)
         self.logger.info(f"Reptile Evaluation Results:\n{summary}")
         
-        # Extract the metrics that baselines expect
-        return {
-            'test_loss': results.get('loss_mean', 0.0),
-            'test_accuracy': results.get('accuracy_mean', 0.0),
-            'full_results': results  # Include full results for analysis
-        }
+        # Return full results in same format as MELoRA for CSV compatibility
+        return results
 
 
 class StandardFineTuning(BaselineMethod):
@@ -707,33 +723,100 @@ class StandardFineTuning(BaselineMethod):
         
     def train(self, meta_train_tasks: List[Tuple[List, List]], 
              meta_val_tasks: Optional[List[Tuple[List, List]]] = None):
-        """Standard training on all tasks (no meta-learning)."""
-        self.logger.info("Standard fine-tuning baseline doesn't use meta-training")
-        self.logger.info("Model will be adapted from scratch for each test task")
+        """Standard fine-tuning on all training data (no meta-learning)."""
+        if not meta_train_tasks:
+            self.logger.info("No training tasks provided for standard fine-tuning")
+            return
+            
+        self.logger.info("Starting standard fine-tuning on all training data")
+        self.logger.info(f"Fine-tuning ALL parameters for {self.epochs} epochs with lr={self.lr}")
+        
+        # Combine all training tasks into one dataset
+        all_train_data = []
+        for support_set, query_set in meta_train_tasks:
+            all_train_data.extend(support_set)
+            all_train_data.extend(query_set)
+            
+        self.logger.info(f"Combined training dataset size: {len(all_train_data)} examples")
+        
+        # Create optimizer for ALL parameters
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        
+        # Log initial memory usage
+        initial_memory = self.memory_profiler.profile_memory('standard_ft_initial')
+        self.logger.info(f"Initial memory: {initial_memory}")
+        
+        # Fine-tuning loop
+        self.model.train()
+        for epoch in range(self.epochs):
+            # Shuffle data each epoch
+            np.random.shuffle(all_train_data)
+            
+            # Create data loader
+            train_loader = self.dataset_loader.get_data_loader(
+                all_train_data, batch_size=16, shuffle=True
+            )
+            
+            epoch_loss = 0.0
+            num_batches = 0
+            
+            pbar = tqdm(train_loader, desc=f"Standard FT Epoch {epoch+1}/{self.epochs}")
+            for batch in pbar:
+                batch = utils.move_to_device(batch, self.device)
+                
+                # Set number of classes based on batch data
+                if hasattr(self.model, 'set_num_classes'):
+                    labels = batch['labels']
+                    num_classes = max(labels.max().item() + 1, 2)  # At least 2 classes
+                    self.model.set_num_classes(num_classes)
+                
+                # Forward pass
+                outputs = self.model(**batch)
+                loss = outputs['loss']
+                
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                num_batches += 1
+                
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            
+            avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
+            self.logger.info(f"Epoch {epoch+1}: Average Loss = {avg_epoch_loss:.4f}")
+            
+            # Memory tracking every few epochs
+            if (epoch + 1) % 3 == 0:
+                memory_stats = self.memory_profiler.profile_memory(f'standard_ft_epoch_{epoch+1}')
+                self.logger.info(f"Memory after epoch {epoch+1}: {memory_stats}")
+        
+        self.logger.info("Standard fine-tuning completed")
         
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
-        """Evaluate by fine-tuning from scratch using same protocol as MELoRA."""
+        """Evaluate by fine-tuning ALL parameters from scratch."""
         from evaluation import Evaluator
         
-        # Use MELoRA's evaluation protocol for fair comparison
-        # But with more epochs for fine-tuning instead of few-shot adaptation
+        # Use MELoRA's evaluation protocol but fine-tune ALL parameters (not just LoRA)
         evaluator = Evaluator(self.model, self.config, self.dataset_loader)
         results = evaluator.evaluate_meta_learning(
             test_tasks, 
             adaptation_steps=self.epochs,  # Use epochs for adaptation
-            adaptation_lr=self.lr
+            adaptation_lr=self.lr,
+            optimize_all_params=True  # Key difference: optimize ALL parameters
         )
         
         # Generate and log summary statistics
         summary = self.generate_summary_statistics(results)
         self.logger.info(f"Standard Fine-tuning Evaluation Results:\n{summary}")
         
-        # Extract the metrics that baselines expect
-        return {
-            'test_loss': results.get('loss_mean', 0.0),
-            'test_accuracy': results.get('accuracy_mean', 0.0),
-            'full_results': results  # Include full results for analysis
-        }
+        # Return full results in same format as MELoRA for CSV compatibility
+        return results
 
 
 class LoRAFineTuning(BaselineMethod):
@@ -747,31 +830,99 @@ class LoRAFineTuning(BaselineMethod):
         
     def train(self, meta_train_tasks: List[Tuple[List, List]], 
              meta_val_tasks: Optional[List[Tuple[List, List]]] = None):
-        """LoRA fine-tuning doesn't use meta-training."""
-        self.logger.info("LoRA fine-tuning baseline doesn't use meta-training")
-        self.logger.info("LoRA parameters will be adapted from scratch for each test task")
+        """LoRA fine-tuning on all training data (no meta-learning)."""
+        if not meta_train_tasks:
+            self.logger.info("No training tasks provided for LoRA fine-tuning")
+            return
+            
+        self.logger.info("Starting LoRA fine-tuning on all training data")
+        self.logger.info(f"Fine-tuning ONLY LoRA parameters for {self.epochs} epochs with lr={self.lr}")
+        
+        # Combine all training tasks into one dataset
+        all_train_data = []
+        for support_set, query_set in meta_train_tasks:
+            all_train_data.extend(support_set)
+            all_train_data.extend(query_set)
+            
+        self.logger.info(f"Combined training dataset size: {len(all_train_data)} examples")
+        
+        # Create optimizer for ONLY LoRA parameters
+        optimizer = torch.optim.Adam(self.model.get_lora_parameters(), lr=self.lr)
+        
+        # Log initial memory usage
+        initial_memory = self.memory_profiler.profile_memory('lora_ft_initial')
+        self.logger.info(f"Initial memory: {initial_memory}")
+        
+        # Fine-tuning loop
+        self.model.train()
+        for epoch in range(self.epochs):
+            # Shuffle data each epoch
+            np.random.shuffle(all_train_data)
+            
+            # Create data loader
+            train_loader = self.dataset_loader.get_data_loader(
+                all_train_data, batch_size=16, shuffle=True
+            )
+            
+            epoch_loss = 0.0
+            num_batches = 0
+            
+            pbar = tqdm(train_loader, desc=f"LoRA FT Epoch {epoch+1}/{self.epochs}")
+            for batch in pbar:
+                batch = utils.move_to_device(batch, self.device)
+                
+                # Set number of classes based on batch data
+                if hasattr(self.model, 'set_num_classes'):
+                    labels = batch['labels']
+                    num_classes = max(labels.max().item() + 1, 2)  # At least 2 classes
+                    self.model.set_num_classes(num_classes)
+                
+                # Forward pass
+                outputs = self.model(**batch)
+                loss = outputs['loss']
+                
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                
+                # Gradient clipping for LoRA parameters
+                torch.nn.utils.clip_grad_norm_(self.model.get_lora_parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                num_batches += 1
+                
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            
+            avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
+            self.logger.info(f"Epoch {epoch+1}: Average Loss = {avg_epoch_loss:.4f}")
+            
+            # Memory tracking every few epochs
+            if (epoch + 1) % 3 == 0:
+                memory_stats = self.memory_profiler.profile_memory(f'lora_ft_epoch_{epoch+1}')
+                self.logger.info(f"Memory after epoch {epoch+1}: {memory_stats}")
+        
+        self.logger.info("LoRA fine-tuning completed")
         
     def evaluate(self, test_tasks: List[Tuple[List, List]]) -> Dict[str, float]:
-        """Evaluate by fine-tuning LoRA parameters on each task."""
+        """Evaluate by fine-tuning LoRA parameters ONLY on each task."""
         from evaluation import Evaluator
         
         evaluator = Evaluator(self.model, self.config, self.dataset_loader)
         results = evaluator.evaluate_meta_learning(
             test_tasks, 
             adaptation_steps=self.epochs,  # Use epochs for adaptation
-            adaptation_lr=self.lr
+            adaptation_lr=self.lr,
+            optimize_all_params=False  # Key difference: optimize ONLY LoRA parameters
         )
         
         # Generate and log summary statistics
         summary = self.generate_summary_statistics(results)
         self.logger.info(f"LoRA Fine-tuning Evaluation Results:\n{summary}")
         
-        # Extract the metrics that baselines expect
-        return {
-            'test_loss': results.get('loss_mean', 0.0),
-            'test_accuracy': results.get('accuracy_mean', 0.0),
-            'full_results': results  # Include full results for analysis
-        }
+        # Return full results in same format as MELoRA for CSV compatibility
+        return results
 
 
 def create_baseline(baseline_name: str, 

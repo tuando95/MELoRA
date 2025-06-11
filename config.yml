@@ -345,9 +345,9 @@ baselines:
     - name: "reptile"
       enabled: true
       config:
-        lr: 0.001
-        inner_steps: 5
-        epsilon: 0.1
+        lr: 0.01  # Increased for better adaptation
+        inner_steps: 3  # Reduced for speed while maintaining effectiveness
+        epsilon: 0.5  # Much higher for better meta-learning (will be scaled to 1.0 in code)
     
     - name: "fine_tuning"
       enabled: true
