@@ -195,60 +195,59 @@ class FullMAML(BaselineMethod):
         total_loss = 0.0
         
         try:
-        
-        for support_set, query_set in task_batch:
-            # Set the number of classes for this task
-            num_classes = self._get_num_classes_from_data(support_set + query_set)
-            self.model.set_num_classes(num_classes)
-            # Get initial LoRA parameters
-            lora_params = self.model.get_lora_parameters()
-            fast_weights = [p.clone() for p in lora_params]
-            
-            # Create parameter mapping for functional forward
-            param_dict = self._create_param_dict(fast_weights)
-            
-            # Inner loop adaptation
-            for _ in range(self.inner_steps):
-                support_loader = self.dataset_loader.get_data_loader(
-                    support_set, batch_size=len(support_set)
+            for support_set, query_set in task_batch:
+                # Set the number of classes for this task
+                num_classes = self._get_num_classes_from_data(support_set + query_set)
+                self.model.set_num_classes(num_classes)
+                # Get initial LoRA parameters
+                lora_params = self.model.get_lora_parameters()
+                fast_weights = [p.clone() for p in lora_params]
+                
+                # Create parameter mapping for functional forward
+                param_dict = self._create_param_dict(fast_weights)
+                
+                # Inner loop adaptation
+                for _ in range(self.inner_steps):
+                    support_loader = self.dataset_loader.get_data_loader(
+                        support_set, batch_size=len(support_set)
+                    )
+                    
+                    for batch in support_loader:
+                        batch = utils.move_to_device(batch, self.device)
+                        
+                        # Forward with fast weights
+                        outputs = self._functional_forward(batch, param_dict)
+                        loss = outputs['loss']
+                        
+                        # Compute gradients
+                        grads = torch.autograd.grad(loss, fast_weights, create_graph=True, allow_unused=True)
+                        
+                        # Handle None gradients for unused parameters
+                        grads = [g if g is not None else torch.zeros_like(w) 
+                                for g, w in zip(grads, fast_weights)]
+                        
+                        # Update fast weights
+                        fast_weights = [w - self.inner_lr * g 
+                                      for w, g in zip(fast_weights, grads)]
+                        
+                        # Update parameter dictionary
+                        param_dict = self._create_param_dict(fast_weights)
+                        
+                # Compute query loss
+                query_loader = self.dataset_loader.get_data_loader(
+                    query_set, batch_size=len(query_set)
                 )
                 
-                for batch in support_loader:
+                for batch in query_loader:
                     batch = utils.move_to_device(batch, self.device)
-                    
-                    # Forward with fast weights
                     outputs = self._functional_forward(batch, param_dict)
-                    loss = outputs['loss']
+                    query_loss = outputs['loss']
+                    total_loss += query_loss
                     
-                    # Compute gradients
-                    grads = torch.autograd.grad(loss, fast_weights, create_graph=True, allow_unused=True)
-                    
-                    # Handle None gradients for unused parameters
-                    grads = [g if g is not None else torch.zeros_like(w) 
-                            for g, w in zip(grads, fast_weights)]
-                    
-                    # Update fast weights
-                    fast_weights = [w - self.inner_lr * g 
-                                  for w, g in zip(fast_weights, grads)]
-                    
-                    # Update parameter dictionary
-                    param_dict = self._create_param_dict(fast_weights)
-                    
-            # Compute query loss
-            query_loader = self.dataset_loader.get_data_loader(
-                query_set, batch_size=len(query_set)
-            )
+            # Backward through everything (second-order)
+            total_loss = total_loss / len(task_batch)
+            total_loss.backward()
             
-            for batch in query_loader:
-                batch = utils.move_to_device(batch, self.device)
-                outputs = self._functional_forward(batch, param_dict)
-                query_loss = outputs['loss']
-                total_loss += query_loss
-                
-        # Backward through everything (second-order)
-        total_loss = total_loss / len(task_batch)
-        total_loss.backward()
-        
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             
